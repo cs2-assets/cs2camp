@@ -24,8 +24,9 @@ import {
   STAGES,
   STAGE_LABELS,
 } from "./engine.js";
-import { createVeto, currentAction, applyVeto, autoVeto } from "./veto.js";
+import { createVeto, currentAction, applyVeto, autoVetoOpponent } from "./veto.js";
 import { migrateIndexedDBToFirestore } from "./migrate.js";
+import { confirmDialog } from "./dialog.js";
 
 // ---- State ---------------------------------------------------------------
 
@@ -73,6 +74,16 @@ function avatar(team, size = "h-10 w-10 text-xs") {
 
 function isUserTeam(team) {
   return team && tournament && team.id === tournament.selectedTeamId;
+}
+
+// Which veto side ("A" or "B") the user's team is on in this match, or null if
+// the match doesn't involve the user. Used to keep the user's bans/picks manual
+// while the opponent's are auto-resolved.
+function userVetoSide(match) {
+  if (!match || !tournament) return null;
+  if (match.teamA && match.teamA.id === tournament.selectedTeamId) return "A";
+  if (match.teamB && match.teamB.id === tournament.selectedTeamId) return "B";
+  return null;
 }
 
 // Starting-side badge: CT (blue) or T (amber).
@@ -432,12 +443,11 @@ function vetoPanel(match) {
   if (!veto) {
     return `
       <div class="text-center space-y-3 bg-panel rounded-xl p-4 border border-slate-800">
-        <p class="text-slate-400 text-sm">No maps vetoed yet. Run the BO3 ban/pick phase.</p>
-        <div class="flex gap-2 justify-center">
+        <p class="text-slate-400 text-sm">No maps vetoed yet. You ban and pick manually —
+          your opponent's choices are made at random.</p>
+        <div class="flex justify-center">
           <button data-action="start-veto" data-match="${match.id}"
-            class="px-4 py-2 rounded bg-slate-700 hover:bg-slate-600 transition text-sm">Manual Veto</button>
-          <button data-action="auto-veto" data-match="${match.id}"
-            class="px-4 py-2 rounded bg-accent text-ink font-semibold hover:brightness-110 transition text-sm">Auto Veto</button>
+            class="px-4 py-2 rounded bg-accent text-ink font-semibold hover:brightness-110 transition text-sm">Start Map Veto</button>
         </div>
       </div>`;
   }
@@ -454,6 +464,8 @@ function vetoPanel(match) {
 
   let actionBox = "";
   if (!veto.complete) {
+    // Opponent turns are auto-resolved before render, so the pending action is
+    // always the user's own ban/pick.
     const action = currentAction(veto);
     const activeTeam = action.team === "A" ? match.teamA : match.teamB;
     const verb = action.type === "ban" ? "BAN" : "PICK";
@@ -465,10 +477,9 @@ function vetoPanel(match) {
     actionBox = `
       <div class="mt-3 p-3 rounded-lg bg-slate-900/60 border border-slate-800">
         <div class="text-sm mb-2"><span class="font-bold">${esc(activeTeam.name)}</span> to
-          <span class="${verbColor} font-bold">${verb}</span></div>
+          <span class="${verbColor} font-bold">${verb}</span>
+          <span class="text-slate-500 text-xs">· your pick</span></div>
         <div class="flex flex-wrap gap-2">${maps}</div>
-        <button data-action="auto-veto" data-match="${match.id}"
-          class="mt-3 text-xs text-slate-500 hover:text-accent transition">Skip · auto-complete veto</button>
       </div>`;
   }
 
@@ -642,7 +653,13 @@ async function onClick(e) {
     }
 
     case "delete": {
-      if (!confirm("Delete this championship? This cannot be undone.")) return;
+      const ok = await confirmDialog({
+        title: "Delete championship?",
+        message: "This permanently removes the saved championship. This cannot be undone.",
+        confirmLabel: "Delete",
+        danger: true,
+      });
+      if (!ok) return;
       try { await deleteChampionship(el.dataset.id); } catch (e) { console.error(e); }
       if (el.dataset.id === championshipId) {
         tournament = null;
@@ -663,19 +680,18 @@ async function onClick(e) {
         const m = findMatch(t, matchId);
         if (!m.veto) m.veto = createVeto();
         if (m.status === "pending") m.status = "live";
-      });
-
-    case "auto-veto":
-      return update((t) => {
-        const m = findMatch(t, matchId);
-        m.veto = autoVeto();
-        if (m.status === "pending") m.status = "live";
+        // Auto-resolve any leading opponent turns so the user lands on theirs.
+        autoVetoOpponent(m.veto, userVetoSide(m));
       });
 
     case "veto-pick":
       return update((t) => {
         const m = findMatch(t, matchId);
-        if (m.veto && !m.veto.complete) applyVeto(m.veto, el.dataset.map);
+        if (m.veto && !m.veto.complete && currentAction(m.veto)?.team === userVetoSide(m)) {
+          applyVeto(m.veto, el.dataset.map);
+          // Then let the opponent randomly resolve up to the user's next turn.
+          autoVetoOpponent(m.veto, userVetoSide(m));
+        }
       });
 
     case "save-score": {
@@ -701,7 +717,13 @@ async function onClick(e) {
       return downloadJSON();
 
     case "reset": {
-      if (!confirm("Delete this championship? This cannot be undone.")) return;
+      const ok = await confirmDialog({
+        title: "Delete championship?",
+        message: "This permanently removes the saved championship. This cannot be undone.",
+        confirmLabel: "Delete",
+        danger: true,
+      });
+      if (!ok) return;
       try { if (championshipId) await deleteChampionship(championshipId); } catch (e2) { console.error(e2); }
       tournament = null;
       championshipId = null;

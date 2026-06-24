@@ -89,3 +89,21 @@ export function autoVeto(rng = Math.random) {
   }
   return veto;
 }
+
+// Auto-resolve the adversary's bans/picks with random map choices, stopping as
+// soon as it's `userSide`'s turn (or the veto completes). The user's own side
+// is never auto-applied — those steps are always made manually. `userSide` is
+// "A" or "B"; pass null to auto-resolve the entire veto.
+export function autoVetoOpponent(veto, userSide, rng = Math.random) {
+  while (!veto.complete) {
+    const action = currentAction(veto);
+    if (!action) break;
+    // Wait for manual input on the user's turn. The decider (team === null) is
+    // assigned automatically inside applyVeto, so it never surfaces here.
+    if (action.team === userSide || action.team == null) break;
+    const choice = randomVetoChoice(veto, rng);
+    if (choice == null) break;
+    applyVeto(veto, choice, rng);
+  }
+  return veto;
+}
