@@ -1,0 +1,19 @@
+rules_version = '2';
+
+// Rules for the named "chemist-site" Firestore database.
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    // The client has no authentication wired in yet, so the championships
+    // collection is openly readable/writable. Lock this down (e.g. require
+    // request.auth != null) before treating the data as anything but public.
+    match /championships/{championshipId} {
+      allow read, write: if true;
+    }
+
+    // Everything else is denied by default.
+    match /{document=**} {
+      allow read, write: if false;
+    }
+  }
+}

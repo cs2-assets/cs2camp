@@ -25,6 +25,7 @@ import {
   STAGE_LABELS,
 } from "./engine.js";
 import { createVeto, currentAction, applyVeto, autoVeto } from "./veto.js";
+import { migrateIndexedDBToFirestore } from "./migrate.js";
 
 // ---- State ---------------------------------------------------------------
 
@@ -733,6 +734,8 @@ function downloadJSON() {
 async function main() {
   try {
     await initDB();
+    // One-time copy of any championships saved by the old IndexedDB build.
+    await migrateIndexedDBToFirestore();
     await refreshChampionships();
   } catch (err) {
     console.error("DB init failed, continuing in-memory:", err);

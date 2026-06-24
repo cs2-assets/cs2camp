@@ -1,0 +1,16 @@
+{
+  "hosting": {
+    "site": "cs2camp",
+    "public": "dist",
+    "ignore": [
+      "firebase.json",
+      "**/.*",
+      "**/node_modules/**"
+    ]
+  },
+  "firestore": {
+    "database": "chemist-site",
+    "rules": "firestore.rules",
+    "indexes": "firestore.indexes.json"
+  }
+}

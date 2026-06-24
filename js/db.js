@@ -1,49 +1,31 @@
-// db.js — IndexedDB persistence layer.
+// db.js — Firestore persistence layer.
 //
-// Multiple championships are stored, each as its own record:
-//   { id, name, state, createdAt, updatedAt }
-// `state` is the full Tournament snapshot; `id`/`name` identify the saved
-// championship so the user can keep several and pick one to continue.
+// Multiple championships are stored in the "championships" collection of the
+// named Firestore database (see firebase.js). Each document is:
+//   { name, stateJson, createdAt, updatedAt }
+// The full Tournament snapshot is serialized into `stateJson` because the
+// snapshot contains directly-nested arrays (e.g. `rounds` is an array of
+// arrays), which Firestore does not allow as native fields. `name` and the
+// timestamps are kept as real fields so they can be queried and ordered.
 
-const DB_NAME = "cs2_championship_db";
-// v3 introduced the group stage; the tournament snapshot shape changed
-// incompatibly, so legacy records are cleared on upgrade.
-const DB_VERSION = 3;
-const STORE = "tournament";
+import { db } from "./firebase.js";
+import {
+  collection,
+  doc,
+  getDoc,
+  getDocs,
+  setDoc,
+  deleteDoc,
+  query,
+  orderBy,
+} from "firebase/firestore";
 
-let db = null;
+const COLLECTION = "championships";
 
+// Kept for API compatibility with the previous IndexedDB layer. The Firestore
+// SDK needs no explicit open step, so there is nothing to initialize here.
 export function initDB() {
-  return new Promise((resolve, reject) => {
-    const request = indexedDB.open(DB_NAME, DB_VERSION);
-
-    request.onupgradeneeded = (event) => {
-      const database = event.target.result;
-      const oldVersion = event.oldVersion || 0;
-      let store;
-      if (!database.objectStoreNames.contains(STORE)) {
-        store = database.createObjectStore(STORE, { keyPath: "id" });
-      } else {
-        store = event.target.transaction.objectStore(STORE);
-      }
-      if (!store.indexNames.contains("updatedAt")) {
-        store.createIndex("updatedAt", "updatedAt", { unique: false });
-      }
-      // The group-stage format (v3) is not backward compatible with snapshots
-      // saved by earlier versions — drop them so the app never loads a state
-      // that the renderer/engine cannot handle.
-      if (oldVersion > 0 && oldVersion < 3) {
-        store.clear();
-      }
-    };
-
-    request.onsuccess = (event) => {
-      db = event.target.result;
-      resolve(db);
-    };
-
-    request.onerror = () => reject(request.error);
-  });
+  return Promise.resolve();
 }
 
 function genId() {
@@ -51,80 +33,92 @@ function genId() {
   return "c-" + Date.now().toString(36) + "-" + Math.random().toString(36).slice(2, 8);
 }
 
+function col() {
+  return collection(db, COLLECTION);
+}
+
+// Map a Firestore document into the metadata + state shape the app expects.
+function fromDoc(snap) {
+  const d = snap.data() || {};
+  let state = null;
+  try {
+    state = d.stateJson ? JSON.parse(d.stateJson) : d.state ?? null;
+  } catch (e) {
+    console.error("failed to parse championship state", e);
+  }
+  return {
+    id: snap.id,
+    name: d.name || "Untitled Championship",
+    state,
+    createdAt: d.createdAt || 0,
+    updatedAt: d.updatedAt || 0,
+  };
+}
+
 // Create a brand-new championship record. Resolves with its metadata.
-export function createChampionship(name, state) {
-  return new Promise((resolve, reject) => {
-    const now = Date.now();
-    const record = { id: genId(), name, state, createdAt: now, updatedAt: now };
-    const tx = db.transaction(STORE, "readwrite");
-    const request = tx.objectStore(STORE).add(record);
-    request.onsuccess = () => resolve(record);
-    request.onerror = () => reject(request.error);
-  });
+export async function createChampionship(name, state) {
+  const now = Date.now();
+  const id = genId();
+  const record = {
+    name: name || "Untitled Championship",
+    stateJson: JSON.stringify(state),
+    createdAt: now,
+    updatedAt: now,
+  };
+  await setDoc(doc(db, COLLECTION, id), record);
+  return { id, name: record.name, state, createdAt: now, updatedAt: now };
 }
 
 // Persist an updated snapshot for an existing championship. Falls back to
 // creating the record if it somehow no longer exists.
-export function saveChampionship(id, state, name) {
-  return new Promise((resolve, reject) => {
-    const tx = db.transaction(STORE, "readwrite");
-    const store = tx.objectStore(STORE);
-    const getReq = store.get(id);
-    getReq.onsuccess = () => {
-      const existing = getReq.result || { id, createdAt: Date.now() };
-      const record = {
-        ...existing,
-        id,
-        state,
-        name: name ?? existing.name ?? "Untitled Championship",
-        updatedAt: Date.now(),
-      };
-      const putReq = store.put(record);
-      putReq.onsuccess = () => resolve(record);
-      putReq.onerror = () => reject(putReq.error);
-    };
-    getReq.onerror = () => reject(getReq.error);
-  });
+export async function saveChampionship(id, state, name) {
+  const ref = doc(db, COLLECTION, id);
+  const existing = await getDoc(ref);
+  const createdAt = existing.exists() ? existing.data().createdAt || Date.now() : Date.now();
+  const resolvedName =
+    name ?? (existing.exists() ? existing.data().name : null) ?? "Untitled Championship";
+  const now = Date.now();
+  const record = {
+    name: resolvedName,
+    stateJson: JSON.stringify(state),
+    createdAt,
+    updatedAt: now,
+  };
+  await setDoc(ref, record);
+  return { id, name: resolvedName, state, createdAt, updatedAt: now };
 }
 
 // List every saved championship (metadata + state), newest update first.
-export function listChampionships() {
-  return new Promise((resolve, reject) => {
-    const tx = db.transaction(STORE, "readonly");
-    const request = tx.objectStore(STORE).getAll();
-    request.onsuccess = () => {
-      const rows = (request.result || []).map((r) => ({
-        id: r.id,
-        name: r.name || "Untitled Championship",
-        state: r.state,
-        createdAt: r.createdAt || 0,
-        updatedAt: r.updatedAt || 0,
-      }));
-      rows.sort((a, b) => b.updatedAt - a.updatedAt);
-      resolve(rows);
-    };
-    request.onerror = () => reject(request.error);
-  });
+export async function listChampionships() {
+  const snap = await getDocs(query(col(), orderBy("updatedAt", "desc")));
+  return snap.docs.map(fromDoc);
 }
 
 // Load a single championship by id. Resolves null when not found.
-export function loadChampionship(id) {
-  return new Promise((resolve, reject) => {
-    const tx = db.transaction(STORE, "readonly");
-    const request = tx.objectStore(STORE).get(id);
-    request.onsuccess = () => {
-      const r = request.result;
-      resolve(r ? { id: r.id, name: r.name || "Untitled Championship", state: r.state } : null);
-    };
-    request.onerror = () => reject(request.error);
-  });
+export async function loadChampionship(id) {
+  const snap = await getDoc(doc(db, COLLECTION, id));
+  if (!snap.exists()) return null;
+  const { name, state } = fromDoc(snap);
+  return { id, name, state };
 }
 
-export function deleteChampionship(id) {
-  return new Promise((resolve, reject) => {
-    const tx = db.transaction(STORE, "readwrite");
-    const request = tx.objectStore(STORE).delete(id);
-    request.onsuccess = () => resolve(true);
-    request.onerror = () => reject(request.error);
+export async function deleteChampionship(id) {
+  await deleteDoc(doc(db, COLLECTION, id));
+  return true;
+}
+
+// Write a championship using a caller-supplied id and timestamps, overwriting
+// any existing document with that id. Used by the one-time IndexedDB ->
+// Firestore migration so original records keep their id and created/updated
+// times instead of getting fresh ones.
+export async function importChampionship(record) {
+  const { id, name, state, createdAt, updatedAt } = record;
+  const now = Date.now();
+  await setDoc(doc(db, COLLECTION, id), {
+    name: name || "Untitled Championship",
+    stateJson: JSON.stringify(state),
+    createdAt: createdAt || now,
+    updatedAt: updatedAt || now,
   });
+  return id;
 }

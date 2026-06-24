@@ -5,11 +5,11 @@
 export const MAP_POOL = [
   "Ancient",
   "Anubis",
+  "Cache",
   "Dust II",
   "Inferno",
   "Mirage",
   "Nuke",
-  "Overpass",
 ];
 
 // Map display name -> local icon (CS2 map icons sourced from
@@ -17,11 +17,11 @@ export const MAP_POOL = [
 const MAP_ICONS = {
   Ancient: "img/maps/de_ancient.png",
   Anubis: "img/maps/de_anubis.png",
+  Cache: "img/maps/de_cache.png",
   "Dust II": "img/maps/de_dust2.png",
   Inferno: "img/maps/de_inferno.png",
   Mirage: "img/maps/de_mirage.png",
   Nuke: "img/maps/de_nuke.png",
-  Overpass: "img/maps/de_overpass.png",
 };
 
 export function mapIcon(name) {
