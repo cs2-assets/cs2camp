@@ -1,5 +1,5 @@
 {
-  "name": " ",
+  "name": "cscamp",
   "version": "0.0.1",
   "description": "",
   "private": true,
@@ -27,6 +27,7 @@
     "webpack-merge": "^5.10.0"
   },
   "dependencies": {
-    "firebase": "^12.15.0"
+    "firebase": "^12.15.0",
+    "sortablejs": "^1.15.7"
   }
 }

@@ -28,7 +28,8 @@ import { createVeto, currentAction, applyVeto, autoVetoOpponent, userOptions, ch
 import { migrateIndexedDBToFirestore } from "./migrate.js";
 import { confirmDialog } from "./dialog.js";
 import { withLoading, setSaving } from "./loading.js";
-import { getMapOrder, setMapOrder, reorderMap, clearMapOrder } from "./prefs.js";
+import { getMapOrder, setMapOrder, clearMapOrder } from "./prefs.js";
+import Sortable from "sortablejs";
 
 // ---- State ---------------------------------------------------------------
 
@@ -146,7 +147,7 @@ function shell(inner, opts = {}) {
     : "";
   app().innerHTML = `
     <div class="max-w-7xl mx-auto px-4 py-6">
-      <header class="flex items-center justify-between mb-6 gap-3">
+      <header class="flex items-center justify-between mb-6 gap-3 bg-panel border border-slate-800 rounded-xl px-4 py-3 shadow-lg">
         <div class="flex items-center gap-3 min-w-0">
           ${back}
           <h1 class="text-lg sm:text-2xl font-black tracking-tight truncate">
@@ -186,17 +187,17 @@ function championshipRow(c) {
 }
 
 // Map pool used for the BO3 veto, shown on the home screen as a drag-and-drop
-// ranked list: the order is the user's team preference and drives the order of
-// their veto pick/ban options.
+// ranked list (powered by SortableJS, see initMapSort): the order is the user's
+// team preference and drives the order of their veto pick/ban options.
 function mapPoolSection() {
   const order = getMapOrder();
   const chips = order.map((m, i) => `
-    <div draggable="true" data-map-chip="${esc(m)}"
-      class="group flex items-center gap-2 bg-panel border border-slate-800 rounded-lg px-3 py-2 cursor-grab active:cursor-grabbing hover:border-accent/60 transition">
-      <span class="text-xs font-mono text-slate-500 w-5 text-center shrink-0">${i + 1}</span>
+    <div data-map-chip="${esc(m)}"
+      class="group flex items-center gap-2 bg-panel border border-slate-800 rounded-lg px-3 py-2 hover:border-accent/60 transition">
+      <span data-rank class="text-xs font-mono text-slate-500 w-5 text-center shrink-0">${i + 1}</span>
       ${mapIconImg(m, "h-6 w-6")}
       <span class="text-sm font-medium truncate flex-1">${esc(m)}</span>
-      <span class="text-slate-600 group-hover:text-slate-400 select-none shrink-0" aria-hidden="true">⠿</span>
+      <span data-drag-handle class="text-slate-600 group-hover:text-slate-400 select-none shrink-0 cursor-grab active:cursor-grabbing px-1" aria-label="Drag to reorder" title="Drag to reorder">⠿</span>
     </div>`).join("");
   return `
     <div class="space-y-2">
@@ -204,9 +205,28 @@ function mapPoolSection() {
         <div class="text-xs uppercase tracking-wide text-slate-500">Map Pool · ${order.length} maps · your preference</div>
         <button data-action="reset-map-order" class="text-xs text-slate-500 hover:text-accent transition">Reset order</button>
       </div>
-      <p class="text-xs text-slate-600">Drag to rank maps by preference — most preferred first. Used to order your veto picks and bans.</p>
+      <p class="text-xs text-slate-600">Drag the handle to rank maps by preference — most preferred first. Used to order your veto picks and bans.</p>
       <div data-map-pool class="flex flex-col gap-2">${chips}</div>
     </div>`;
+}
+
+// (Re)initialise SortableJS on the map preference list after each home render.
+let mapSortable = null;
+function initMapSort() {
+  const list = document.querySelector("[data-map-pool]");
+  if (!list) return;
+  if (mapSortable) { mapSortable.destroy(); mapSortable = null; }
+  mapSortable = Sortable.create(list, {
+    animation: 150,
+    handle: "[data-drag-handle]",
+    ghostClass: "opacity-40",
+    onEnd: () => {
+      const order = Array.from(list.querySelectorAll("[data-map-chip]")).map((c) => c.dataset.mapChip);
+      setMapOrder(order);
+      // Renumber ranks in place (no full re-render needed).
+      list.querySelectorAll("[data-map-chip] [data-rank]").forEach((el, i) => { el.textContent = i + 1; });
+    },
+  });
 }
 
 function renderHome() {
@@ -215,21 +235,27 @@ function renderHome() {
     : `<p class="text-slate-500 text-sm">No saved championships yet — create your first one.</p>`;
 
   shell(`
-    <div class="max-w-2xl mx-auto space-y-8">
-      <div class="text-center space-y-2 pt-4">
-        <h2 class="text-4xl sm:text-6xl font-black">Build Your <span class="text-accent">Tournament</span></h2>
-      </div>
+    <div class="fixed inset-0 -z-10 bg-cover bg-center"
+      style="background-image:linear-gradient(to bottom, rgba(11,17,32,0.55), rgba(11,17,32,0.8)), url('img/bg/bg2.jpg')"></div>
+    <div class="fixed bottom-2 right-3 -z-10 text-[10px] text-slate-400/70 select-none">
+      Counter-Strike © Valve</div>
+    <div class="max-w-5xl mx-auto space-y-8">
       <div class="text-center">
         <button data-action="new"
-          class="px-6 py-3 rounded-lg bg-accent text-ink hover:brightness-110 transition font-bold">
-          + New Championship</button>
+          class="px-6 py-3 rounded-lg bg-accent text-ink hover:brightness-110 transition font-bold shadow-lg">
+          + Create</button>
       </div>
-      ${mapPoolSection()}
-      <div class="space-y-2">
-        <div class="text-xs uppercase tracking-wide text-slate-500">Saved championships</div>
-        ${list}
+      <div class="grid grid-cols-1 lg:grid-cols-2 gap-6 items-start">
+        <div class="bg-ink border border-slate-800 rounded-xl p-4 shadow-xl space-y-3">
+          <div class="text-xs uppercase tracking-wide text-slate-500">Saved championships</div>
+          ${list}
+        </div>
+        <div class="bg-ink border border-slate-800 rounded-xl p-4 shadow-xl">
+          ${mapPoolSection()}
+        </div>
       </div>
     </div>`);
+  initMapSort();
 }
 
 // ---- Name a new championship ---------------------------------------------
@@ -808,43 +834,6 @@ function flash(input) {
   setTimeout(() => input.classList.remove("ring-2", "ring-red-500"), 600);
 }
 
-// ---- Map-pool drag-and-drop ranking --------------------------------------
-
-let draggedMap = null;
-
-function onDragStart(e) {
-  const chip = e.target.closest("[data-map-chip]");
-  if (!chip) return;
-  draggedMap = chip.dataset.mapChip;
-  e.dataTransfer.effectAllowed = "move";
-  try { e.dataTransfer.setData("text/plain", draggedMap); } catch { /* ignore */ }
-  chip.classList.add("opacity-50");
-}
-
-function onDragOver(e) {
-  if (!draggedMap) return;
-  const chip = e.target.closest("[data-map-chip]");
-  if (!chip) return;
-  e.preventDefault();
-  e.dataTransfer.dropEffect = "move";
-}
-
-function onDrop(e) {
-  if (!draggedMap) return;
-  const chip = e.target.closest("[data-map-chip]");
-  if (!chip) return;
-  e.preventDefault();
-  const order = reorderMap(draggedMap, chip.dataset.mapChip);
-  draggedMap = null;
-  setMapOrder(order);
-  render();
-}
-
-function onDragEnd() {
-  draggedMap = null;
-  document.querySelectorAll("[data-map-chip].opacity-50")
-    .forEach((c) => c.classList.remove("opacity-50"));
-}
 
 // ---- Bootstrap ------------------------------------------------------------
 
@@ -861,11 +850,6 @@ async function main() {
   }
   view = { name: "home" };
   app().addEventListener("click", onClick);
-  // Drag-and-drop reordering of the map preference list.
-  app().addEventListener("dragstart", onDragStart);
-  app().addEventListener("dragover", onDragOver);
-  app().addEventListener("drop", onDrop);
-  app().addEventListener("dragend", onDragEnd);
   // Submit the championship name with Enter.
   app().addEventListener("keydown", (e) => {
     if (e.key === "Enter" && e.target.matches("[data-name-input]")) {

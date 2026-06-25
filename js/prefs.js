@@ -23,18 +23,6 @@ export function setMapOrder(order) {
   try { localStorage.setItem(MAP_ORDER_KEY, JSON.stringify(order)); } catch { /* ignore */ }
 }
 
-// Move `map` to sit at `target`'s position, returning the new order. No-op if
-// either map is missing or they're the same.
-export function reorderMap(map, target) {
-  const order = getMapOrder();
-  const from = order.indexOf(map);
-  const to = order.indexOf(target);
-  if (from < 0 || to < 0 || from === to) return order;
-  order.splice(from, 1);
-  order.splice(to, 0, map);
-  return order;
-}
-
 export function clearMapOrder() {
   try { localStorage.removeItem(MAP_ORDER_KEY); } catch { /* ignore */ }
 }
