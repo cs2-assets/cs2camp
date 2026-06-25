@@ -1,6 +1,6 @@
 // app.js — Bootstrap, in-memory state, UI rendering and event handling.
 
-import { TEAMS, mapIcon } from "./teams.js";
+import { TEAMS, mapIcon, teamLogo } from "./teams.js";
 import {
   initDB,
   createChampionship,
@@ -24,9 +24,11 @@ import {
   STAGES,
   STAGE_LABELS,
 } from "./engine.js";
-import { createVeto, currentAction, applyVeto, autoVetoOpponent } from "./veto.js";
+import { createVeto, currentAction, applyVeto, autoVetoOpponent, userOptions, chooseSide, needsUserSide, PICK_COUNT, BAN_COUNT } from "./veto.js";
 import { migrateIndexedDBToFirestore } from "./migrate.js";
 import { confirmDialog } from "./dialog.js";
+import { withLoading, setSaving } from "./loading.js";
+import { getMapOrder, setMapOrder, reorderMap, clearMapOrder } from "./prefs.js";
 
 // ---- State ---------------------------------------------------------------
 
@@ -37,11 +39,13 @@ let championships = [];        // metadata list shown on the home screen
 let view = { name: "home", matchId: null };
 const app = () => document.getElementById("app");
 
-async function save() {
+async function save({ silent = false } = {}) {
   if (tournament && championshipId) {
+    if (!silent) setSaving(true);
     try {
       await saveChampionship(championshipId, tournament, championshipName);
     } catch (e) { console.error("save failed", e); }
+    finally { if (!silent) setSaving(false); }
   }
 }
 
@@ -50,11 +54,16 @@ async function refreshChampionships() {
   catch (e) { console.error("list failed", e); championships = []; }
 }
 
-// Central mutate-then-persist-then-render helper.
-async function update(mutator) {
-  mutator(tournament);
-  await save();
-  render();
+// Central mutate-then-persist-then-render helper. Pass `loadingMessage` to show
+// a blocking spinner overlay while the change is processed and persisted (the
+// background "Saving…" pill is suppressed in that case to avoid double feedback).
+async function update(mutator, loadingMessage) {
+  const run = async () => {
+    mutator(tournament);
+    await save({ silent: !!loadingMessage });
+    render();
+  };
+  return loadingMessage ? withLoading(loadingMessage, run) : run();
 }
 
 // ---- Small view helpers --------------------------------------------------
@@ -68,8 +77,16 @@ function avatarColor(id) {
 
 function avatar(team, size = "h-10 w-10 text-xs") {
   if (!team) return `<div class="${size} rounded bg-slate-700/60 grid place-items-center text-slate-500 font-bold">?</div>`;
-  return `<div class="${size} rounded grid place-items-center font-bold text-white shrink-0"
-    style="background:${avatarColor(team.id)}">${esc(team.tag.slice(0, 4))}</div>`;
+  const logo = teamLogo(team.id);
+  // Generated tag avatar is the base; the real logo (if any) overlays it and is
+  // removed on load error, revealing the tag behind it.
+  const overlay = logo
+    ? `<img src="${esc(logo)}" alt="${esc(team.name)}" loading="lazy"
+        onerror="this.remove()"
+        class="absolute inset-0 h-full w-full object-contain bg-slate-900/80 p-0.5" />`
+    : "";
+  return `<div class="${size} rounded grid place-items-center font-bold text-white shrink-0 relative overflow-hidden"
+    style="background:${avatarColor(team.id)}">${esc(team.tag.slice(0, 4))}${overlay}</div>`;
 }
 
 function isUserTeam(team) {
@@ -103,7 +120,9 @@ function esc(s) {
 function mapIconImg(name, size = "h-5 w-5") {
   const src = mapIcon(name);
   if (!src) return "";
-  return `<img src="${esc(src)}" alt="${esc(name)}" loading="lazy"
+  // Hide the image if the asset is missing (e.g. a map with no local icon yet).
+  return `<img src="${esc(src)}" alt="${esc(name)}" loading="lazy" draggable="false"
+    onerror="this.style.display='none'"
     class="${size} object-contain shrink-0" />`;
 }
 
@@ -166,6 +185,30 @@ function championshipRow(c) {
     </div>`;
 }
 
+// Map pool used for the BO3 veto, shown on the home screen as a drag-and-drop
+// ranked list: the order is the user's team preference and drives the order of
+// their veto pick/ban options.
+function mapPoolSection() {
+  const order = getMapOrder();
+  const chips = order.map((m, i) => `
+    <div draggable="true" data-map-chip="${esc(m)}"
+      class="group flex items-center gap-2 bg-panel border border-slate-800 rounded-lg px-3 py-2 cursor-grab active:cursor-grabbing hover:border-accent/60 transition">
+      <span class="text-xs font-mono text-slate-500 w-5 text-center shrink-0">${i + 1}</span>
+      ${mapIconImg(m, "h-6 w-6")}
+      <span class="text-sm font-medium truncate flex-1">${esc(m)}</span>
+      <span class="text-slate-600 group-hover:text-slate-400 select-none shrink-0" aria-hidden="true">⠿</span>
+    </div>`).join("");
+  return `
+    <div class="space-y-2">
+      <div class="flex items-center justify-between gap-2">
+        <div class="text-xs uppercase tracking-wide text-slate-500">Map Pool · ${order.length} maps · your preference</div>
+        <button data-action="reset-map-order" class="text-xs text-slate-500 hover:text-accent transition">Reset order</button>
+      </div>
+      <p class="text-xs text-slate-600">Drag to rank maps by preference — most preferred first. Used to order your veto picks and bans.</p>
+      <div data-map-pool class="flex flex-col gap-2">${chips}</div>
+    </div>`;
+}
+
 function renderHome() {
   const list = championships.length
     ? championships.map(championshipRow).join("")
@@ -174,15 +217,14 @@ function renderHome() {
   shell(`
     <div class="max-w-2xl mx-auto space-y-8">
       <div class="text-center space-y-2 pt-4">
-        <h2 class="text-4xl sm:text-6xl font-black">Build Your <span class="text-accent">Major</span></h2>
-        <p class="text-slate-400 max-w-md mx-auto">Create a championship, pick your team, veto the maps and march to the
-          Grand Final.</p>
+        <h2 class="text-4xl sm:text-6xl font-black">Build Your <span class="text-accent">Tournament</span></h2>
       </div>
       <div class="text-center">
         <button data-action="new"
           class="px-6 py-3 rounded-lg bg-accent text-ink hover:brightness-110 transition font-bold">
           + New Championship</button>
       </div>
+      ${mapPoolSection()}
       <div class="space-y-2">
         <div class="text-xs uppercase tracking-wide text-slate-500">Saved championships</div>
         ${list}
@@ -393,15 +435,8 @@ function renderBracket() {
       </div>
     </section>`;
 
-  const tools = `
-    <div class="flex flex-wrap gap-2 mb-4">
-      <button data-action="download" class="px-3 py-1.5 text-sm rounded bg-slate-700 hover:bg-slate-600 transition">
-        Download JSON</button>
-    </div>`;
-
   shell(`
     ${banner}
-    ${tools}
     ${groupsSection}
     ${playoffSection}`,
     { back: { action: "goto-home", label: "Home" } });
@@ -443,8 +478,9 @@ function vetoPanel(match) {
   if (!veto) {
     return `
       <div class="text-center space-y-3 bg-panel rounded-xl p-4 border border-slate-800">
-        <p class="text-slate-400 text-sm">No maps vetoed yet. You ban and pick manually —
-          your opponent's choices are made at random.</p>
+        <p class="text-slate-400 text-sm">No maps vetoed yet. You pick ${PICK_COUNT} and ban ${BAN_COUNT}
+          maps — your opponent does the same at random, then the 3 maps with the most picks
+          and fewest bans are played.</p>
         <div class="flex justify-center">
           <button data-action="start-veto" data-match="${match.id}"
             class="px-4 py-2 rounded bg-accent text-ink font-semibold hover:brightness-110 transition text-sm">Start Map Veto</button>
@@ -454,7 +490,7 @@ function vetoPanel(match) {
 
   const log = veto.log.map((e) => {
     const team = e.team === "A" ? match.teamA : e.team === "B" ? match.teamB : null;
-    const label = e.type === "ban" ? "BAN" : e.type === "pick" ? "PICK" : "DECIDER";
+    const label = e.type === "ban" ? "BAN" : e.type === "pick" ? "PICK" : "PLAY";
     const color = e.type === "ban" ? "text-red-400" : e.type === "pick" ? "text-emerald-400" : "text-accent";
     return `<div class="flex items-center justify-between text-xs py-0.5">
       <span class="flex items-center gap-1.5"><span class="${color} font-bold">${label}</span>
@@ -470,7 +506,15 @@ function vetoPanel(match) {
     const activeTeam = action.team === "A" ? match.teamA : match.teamB;
     const verb = action.type === "ban" ? "BAN" : "PICK";
     const verbColor = action.type === "ban" ? "text-red-400" : "text-emerald-400";
-    const maps = veto.pool.map((m) => `
+    const ballot = veto.ballots[action.team];
+    const done = action.type === "ban" ? ballot.bans.length : ballot.picks.length;
+    const total = action.type === "ban" ? BAN_COUNT : PICK_COUNT;
+    // Present the options in the user's saved preference order.
+    const pref = getMapOrder();
+    const maps = userOptions(veto)
+      .slice()
+      .sort((x, y) => pref.indexOf(x) - pref.indexOf(y))
+      .map((m) => `
       <button data-action="veto-pick" data-match="${match.id}" data-map="${esc(m)}"
         class="flex items-center gap-1.5 px-3 py-2 rounded bg-slate-800 hover:bg-accent hover:text-ink transition text-sm font-medium">
         ${mapIconImg(m, "h-5 w-5")}${esc(m)}</button>`).join("");
@@ -478,7 +522,7 @@ function vetoPanel(match) {
       <div class="mt-3 p-3 rounded-lg bg-slate-900/60 border border-slate-800">
         <div class="text-sm mb-2"><span class="font-bold">${esc(activeTeam.name)}</span> to
           <span class="${verbColor} font-bold">${verb}</span>
-          <span class="text-slate-500 text-xs">· your pick</span></div>
+          <span class="text-slate-500 text-xs">· ${done + 1} of ${total} · your pick</span></div>
         <div class="flex flex-wrap gap-2">${maps}</div>
       </div>`;
   }
@@ -515,6 +559,27 @@ function mapsPanel(match) {
         </div>`;
     }
     if (isNext) {
+      // The user's team chooses its starting side on maps it didn't pick.
+      const pickSide = needsUserSide(match.veto, i);
+      const body = pickSide
+        ? `<div class="space-y-2">
+            <div class="text-[11px] text-yellow-400">Your team didn't pick this map — choose your starting side:</div>
+            <div class="flex gap-2">
+              <button data-action="choose-side" data-match="${match.id}" data-mapidx="${i}" data-side="CT"
+                class="px-3 py-1 rounded bg-sky-600 hover:bg-sky-500 transition text-sm font-bold">Start CT</button>
+              <button data-action="choose-side" data-match="${match.id}" data-mapidx="${i}" data-side="T"
+                class="px-3 py-1 rounded bg-amber-600 hover:bg-amber-500 transition text-sm font-bold">Start T</button>
+            </div>
+          </div>`
+        : `<div class="flex flex-wrap items-center gap-2">
+            <input type="number" min="0" max="30" value="0" data-score="A"
+              class="w-16 bg-slate-800 rounded px-2 py-1 text-sm text-center" />
+            <span class="text-slate-500 text-xs">${esc(a.tag)} : ${esc(b.tag)}</span>
+            <input type="number" min="0" max="30" value="0" data-score="B"
+              class="w-16 bg-slate-800 rounded px-2 py-1 text-sm text-center" />
+            <button data-action="save-score" data-match="${match.id}" data-map="${esc(mapName)}"
+              class="px-3 py-1 rounded bg-emerald-600 hover:bg-emerald-500 transition text-sm">Enter Score</button>
+          </div>`;
       return `
         <div data-maprow class="rounded bg-slate-900/60 border border-yellow-500/40 px-3 py-2 space-y-2">
           <div class="flex items-center justify-between">
@@ -522,15 +587,7 @@ function mapsPanel(match) {
               <span class="text-yellow-500 text-xs">· next map</span></span>
             ${sides ? `<span class="text-[10px] text-slate-500">${esc(a.tag)} ${sideBadge(sides.sideA)} · ${sideBadge(sides.sideB)} ${esc(b.tag)}</span>` : ""}
           </div>
-          <div class="flex flex-wrap items-center gap-2">
-            <input type="number" min="0" max="30" value="13" data-score="A"
-              class="w-16 bg-slate-800 rounded px-2 py-1 text-sm text-center" />
-            <span class="text-slate-500 text-xs">${esc(a.tag)} : ${esc(b.tag)}</span>
-            <input type="number" min="0" max="30" value="0" data-score="B"
-              class="w-16 bg-slate-800 rounded px-2 py-1 text-sm text-center" />
-            <button data-action="save-score" data-match="${match.id}" data-map="${esc(mapName)}"
-              class="px-3 py-1 rounded bg-emerald-600 hover:bg-emerald-500 transition text-sm">Enter Score</button>
-          </div>
+          ${body}
         </div>`;
     }
     return `
@@ -615,7 +672,7 @@ async function onClick(e) {
       tournament = null;
       championshipId = null;
       championshipName = "";
-      await refreshChampionships();
+      await withLoading("Loading championships…", refreshChampionships);
       view = { name: "home" };
       return render();
 
@@ -623,11 +680,15 @@ async function onClick(e) {
       view = { name: "bracket" };
       return render();
 
+    case "reset-map-order":
+      clearMapOrder();
+      return render();
+
     case "select-team": {
       const state = generateTournament(el.dataset.team);
       const name = (view.pendingName || "").trim() || `Championship ${championships.length + 1}`;
       try {
-        const rec = await createChampionship(name, state);
+        const rec = await withLoading("Creating championship…", () => createChampionship(name, state));
         championshipId = rec.id;
         championshipName = rec.name;
       } catch (e) {
@@ -642,7 +703,7 @@ async function onClick(e) {
 
     case "resume": {
       try {
-        const rec = await loadChampionship(el.dataset.id);
+        const rec = await withLoading("Loading championship…", () => loadChampionship(el.dataset.id));
         if (!rec) { await refreshChampionships(); return render(); }
         championshipId = rec.id;
         championshipName = rec.name;
@@ -660,13 +721,15 @@ async function onClick(e) {
         danger: true,
       });
       if (!ok) return;
-      try { await deleteChampionship(el.dataset.id); } catch (e) { console.error(e); }
-      if (el.dataset.id === championshipId) {
-        tournament = null;
-        championshipId = null;
-        championshipName = "";
-      }
-      await refreshChampionships();
+      await withLoading("Deleting championship…", async () => {
+        try { await deleteChampionship(el.dataset.id); } catch (e) { console.error(e); }
+        if (el.dataset.id === championshipId) {
+          tournament = null;
+          championshipId = null;
+          championshipName = "";
+        }
+        await refreshChampionships();
+      });
       view = { name: "home" };
       return render();
     }
@@ -678,11 +741,11 @@ async function onClick(e) {
     case "start-veto":
       return update((t) => {
         const m = findMatch(t, matchId);
-        if (!m.veto) m.veto = createVeto();
+        if (!m.veto) m.veto = createVeto(userVetoSide(m));
         if (m.status === "pending") m.status = "live";
         // Auto-resolve any leading opponent turns so the user lands on theirs.
         autoVetoOpponent(m.veto, userVetoSide(m));
-      });
+      }, "Starting map veto…");
 
     case "veto-pick":
       return update((t) => {
@@ -692,7 +755,14 @@ async function onClick(e) {
           // Then let the opponent randomly resolve up to the user's next turn.
           autoVetoOpponent(m.veto, userVetoSide(m));
         }
-      });
+      }, "Processing veto…");
+
+    case "choose-side":
+      return update((t) => {
+        const m = findMatch(t, matchId);
+        const idx = parseInt(el.dataset.mapidx, 10);
+        if (m.veto && m.veto.complete) chooseSide(m.veto, idx, el.dataset.side);
+      }, "Saving side choice…");
 
     case "save-score": {
       const row = el.closest("[data-maprow]") || document;
@@ -710,11 +780,8 @@ async function onClick(e) {
           // user is eliminated the rest of the bracket plays out automatically).
           resolveAiMatches(t);
         }
-      });
+      }, "Saving score…");
     }
-
-    case "download":
-      return downloadJSON();
 
     case "reset": {
       const ok = await confirmDialog({
@@ -741,29 +808,64 @@ function flash(input) {
   setTimeout(() => input.classList.remove("ring-2", "ring-red-500"), 600);
 }
 
-function downloadJSON() {
-  const blob = new Blob([JSON.stringify(tournament, null, 2)], { type: "application/json" });
-  const url = URL.createObjectURL(blob);
-  const a = document.createElement("a");
-  a.href = url;
-  a.download = "cs2_tournament.json";
-  a.click();
-  URL.revokeObjectURL(url);
+// ---- Map-pool drag-and-drop ranking --------------------------------------
+
+let draggedMap = null;
+
+function onDragStart(e) {
+  const chip = e.target.closest("[data-map-chip]");
+  if (!chip) return;
+  draggedMap = chip.dataset.mapChip;
+  e.dataTransfer.effectAllowed = "move";
+  try { e.dataTransfer.setData("text/plain", draggedMap); } catch { /* ignore */ }
+  chip.classList.add("opacity-50");
+}
+
+function onDragOver(e) {
+  if (!draggedMap) return;
+  const chip = e.target.closest("[data-map-chip]");
+  if (!chip) return;
+  e.preventDefault();
+  e.dataTransfer.dropEffect = "move";
+}
+
+function onDrop(e) {
+  if (!draggedMap) return;
+  const chip = e.target.closest("[data-map-chip]");
+  if (!chip) return;
+  e.preventDefault();
+  const order = reorderMap(draggedMap, chip.dataset.mapChip);
+  draggedMap = null;
+  setMapOrder(order);
+  render();
+}
+
+function onDragEnd() {
+  draggedMap = null;
+  document.querySelectorAll("[data-map-chip].opacity-50")
+    .forEach((c) => c.classList.remove("opacity-50"));
 }
 
 // ---- Bootstrap ------------------------------------------------------------
 
 async function main() {
   try {
-    await initDB();
-    // One-time copy of any championships saved by the old IndexedDB build.
-    await migrateIndexedDBToFirestore();
-    await refreshChampionships();
+    await withLoading("Loading championships…", async () => {
+      await initDB();
+      // One-time copy of any championships saved by the old IndexedDB build.
+      await migrateIndexedDBToFirestore();
+      await refreshChampionships();
+    });
   } catch (err) {
     console.error("DB init failed, continuing in-memory:", err);
   }
   view = { name: "home" };
   app().addEventListener("click", onClick);
+  // Drag-and-drop reordering of the map preference list.
+  app().addEventListener("dragstart", onDragStart);
+  app().addEventListener("dragover", onDragOver);
+  app().addEventListener("drop", onDrop);
+  app().addEventListener("dragend", onDragEnd);
   // Submit the championship name with Enter.
   app().addEventListener("keydown", (e) => {
     if (e.key === "Enter" && e.target.matches("[data-name-input]")) {

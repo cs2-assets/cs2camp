@@ -10,6 +10,11 @@ export const MAP_POOL = [
   "Inferno",
   "Mirage",
   "Nuke",
+  "Vertigo",
+  "Overpass",
+  "Office",
+  "Italy",
+  "Train",
 ];
 
 // Map display name -> local icon (CS2 map icons sourced from
@@ -22,6 +27,11 @@ const MAP_ICONS = {
   Inferno: "img/maps/de_inferno.png",
   Mirage: "img/maps/de_mirage.png",
   Nuke: "img/maps/de_nuke.png",
+  Overpass: "img/maps/de_overpass.png",
+  Vertigo: "img/maps/de_vertigo.png",
+  Office: "img/maps/cs_office.png",
+  Italy: "img/maps/cs_italy.png",
+  Train: "img/maps/de_train.png",
 };
 
 export function mapIcon(name) {
@@ -33,7 +43,7 @@ const RAW_TEAMS = [
   { name: "FURIA Esports", tag: "FUR", logo: "furi", players: ["yuurih", "FalleN", "KSCERATO", "YEKINDAR", "molodoy"] },
   { name: "Falcons", tag: "FAL", logo: "fal", players: ["NiKo", "TeSeS", "m0NESY", "karrigan", "kyousuke"] },
   { name: "MOUZ", tag: "MOUZ", logo: "mouz", players: ["jL", "torzsi", "Spinx", "xelex", "xertioN"] },
-  { name: "FaZe Clan", tag: "FAZE", logo: "faze", players: ["enkay J", "frozen", "Twistzz", "broky", "jcobbb"] },
+  { name: "FaZe", tag: "FAZE", logo: "faze", players: ["enkay J", "frozen", "Twistzz", "broky", "jcobbb"] },
   { name: "The MongolZ", tag: "MGLZ", logo: "mngz", players: ["bLitz", "Techno4K", "mzinho", "910", "cobrazera"] },
   { name: "Natus Vincere", tag: "NAVI", logo: "navi", players: ["Aleksib", "iM", "b1t", "w0nderful", "makazze"] },
   { name: "Spirit", tag: "SPR", logo: "spir", players: ["sh1ro", "magixx", "tN1R", "zont1x", "donk"] },
@@ -44,9 +54,7 @@ const RAW_TEAMS = [
   { name: "paiN Gaming", tag: "PAIN", logo: "pain", players: ["vsm", "biguzera", "piriajr", "saffee", "snow"] },
   { name: "Astralis", tag: "AST", logo: "astr", players: ["HooXi", "phzy", "jabbi", "Staehr", "ryu"] },
   { name: "Team Liquid", tag: "LIQ", logo: "liq", players: ["NAF", "EliGE", "malbsMd", "siuhy", "ultimate"] },
-  { name: "Passion UA", tag: "PUA", logo: "psnu", players: ["JT", "try", "sdy", "Kvem", "nicx"] },
   { name: "Legacy", tag: "LEG", logo: "lgcy", players: ["dumau", "latto", "n1ssim", "arT", "saadzin"] },
-  { name: "Imperial", tag: "IMP", logo: "imp", players: ["chelo", "VINI", "decenty", "levi", "noway"] },
   { name: "PARIVISION", tag: "PARI", logo: "pari", players: ["Jame", "BELCHONOKK", "xiELO", "nota", "zweih"] },
   { name: "M80", tag: "M80", logo: "m80", players: ["slaxz-", "Swisher", "s1n", "JBa", "Lake"] },
   { name: "GamerLegion", tag: "GL", logo: "gl", players: ["Snax", "REZ", "Tauson", "PR", "hypex"] },
@@ -56,23 +64,34 @@ const RAW_TEAMS = [
   { name: "Lynn Vision", tag: "LV", logo: "lynn", players: ["Westmelon", "z4KR", "Starry", "EmiliaQAQ", "C4LLM3SU3"] },
   { name: "NRG", tag: "NRG", logo: "nrg", players: ["nitr0", "Sonic", "oSee", "br0", "Grim"] },
   { name: "BetBoom", tag: "BB", logo: "bb", players: ["Boombl4", "S1ren", "d1Ledez", "zorte", "Magnojez"] },
-  { name: "FlyQuest", tag: "FQ", logo: "fq", players: ["jks", "INS", "Vexite", "nettik", "story"] },
+  { name: "9z", tag: "9Z", logo: "9z", players: ["exp", "Luchov", "Meyern", "HUASOPEEK", "Max"] },
   { name: "fnatic", tag: "FNC", logo: "fntc", players: ["KRIMZ", "Br4tkO", "fEAR", "jambo", "jackasmo"] },
   { name: "TYLOO", tag: "TYL", logo: "tyl", players: ["JamYoung", "Jee", "Mercury", "Moseyuh", "Zero"] },
   { name: "Fluxo", tag: "FLX", logo: "flux", players: ["Lucaozy", "zevy", "decenty", "kye", "exit"] },
-  { name: "9INE", tag: "9INE", logo: "nein", players: ["raalz", "kraghen", "bnox", "cej0t", "flayy"] },
   { name: "Monte", tag: "MTE", logo: "mont", players: ["Bymas", "afro", "Gizmy", "AZUWU", "Rainwaker"] },
   { name: "BESTIA", tag: "BES", logo: "bes", players: ["nacho", "cass1n", "buda", "tomaszin", "timo"] },
-  { name: "ENCE", tag: "ENCE", logo: "ence", players: ["HENU", "millert", "teme", "Cliqq", "Schwarz"] },
-  { name: "ECSTATIC", tag: "ECS", logo: "ecst", players: ["TMB", "nicoodoz", "Anelele", "Buzz", "nut nut"] },
-  { name: "Rare Atom", tag: "RA", logo: "ratm", players: ["Summer", "3gl", "Trash", "L1haNg", "chengking"] },
-  { name: "OG", tag: "OG", logo: "og", players: ["cadiaN", "spooke", "arrozdoce", "adamb", "bodyy"] },
-  { name: "100 Thieves", tag: "100T", logo: "thv", players: ["Ag1l", "device", "poiii", "sirah", "rain"] },
   { name: "BIG", tag: "BIG", logo: "big", players: ["tabseN", "JDC", "faveN", "blameF", "gr1ks"] },
 ];
 
 function slug(name) {
   return name.toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-|-$/g, "");
+}
+
+// Team ids with a local logo asset (sourced from
+// https://github.com/lootmarket/esport-team-logos). Teams without one fall
+// back to the generated tag avatar in the UI.
+const TEAM_LOGOS = new Set([
+  "9z",
+  "3dmax", "astralis", "aurora", "b8", "bestia", "betboom", "big", "falcons",
+  "faze", "fluxo", "fnatic", "furia-esports", "g2-esports", "gamerlegion",
+  "heroic", "legacy", "lynn-vision", "m80", "monte", "mouz", "natus-vincere",
+  "ninjas-in-pyjamas", "nrg", "pain-gaming", "spirit", "team-liquid",
+  "team-vitality", "the-mongolz", "tyloo", "virtus-pro",
+]);
+
+// Local logo path for a team id, or null when none is available.
+export function teamLogo(id) {
+  return TEAM_LOGOS.has(id) ? `img/teams/${id}.png` : null;
 }
 
 export const TEAMS = RAW_TEAMS.map((t) => ({
