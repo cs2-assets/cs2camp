@@ -21,6 +21,17 @@ function emptyBallot() {
   return { picks: [], bans: [] };
 }
 
+// A unique identifier for a single map match. Used so each played map in a
+// series can be referenced (e.g. copied to set up a dedicated server).
+function uuid() {
+  if (typeof crypto !== "undefined" && crypto.randomUUID) return crypto.randomUUID();
+  return "xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx".replace(/[xy]/g, (c) => {
+    const r = Math.floor(Math.random() * 16);
+    const v = c === "x" ? r : (r & 0x3) | 0x8;
+    return v.toString(16);
+  });
+}
+
 // Build a fresh veto state for a match. `userSide` is the side ("A" or "B")
 // the human fills in manually; pass null for fully automatic (AI vs AI).
 export function createVeto(userSide = null) {
@@ -29,6 +40,7 @@ export function createVeto(userSide = null) {
     ballots: { A: emptyBallot(), B: emptyBallot() },
     log: [],            // [{ type, team, map }] in submission order
     picked: [],         // the MAPS_PLAYED maps to play, in play order
+    mapIds: [],         // per picked map: a unique UUID for that map match
     sideChoice: [],     // per picked map: "A" | "B" | null — who chooses the side
     sides: [],          // per picked map: { sideA, sideB } (CT/T), or null if awaiting the user's choice
     complete: false,
@@ -133,6 +145,7 @@ function applySelectionRule(veto, rng = Math.random) {
   }
 
   veto.picked = chosen;
+  veto.mapIds = chosen.map(() => uuid());
   veto.log.push(...veto.picked.map((map) => ({ type: "result", team: null, map })));
   veto.sideChoice = veto.picked.map((map) => sideChoiceFor(veto, map));
   assignSides(veto, rng);

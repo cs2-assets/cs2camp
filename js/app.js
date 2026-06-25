@@ -8,6 +8,8 @@ import {
   listChampionships,
   loadChampionship,
   deleteChampionship,
+  getCsMatches,
+  getCsPlayerMatchesByUser,
 } from "./db.js";
 import {
   generateTournament,
@@ -58,6 +60,14 @@ let championshipName = "";    // its display name
 let championships = [];        // metadata list shown on the home screen
 let view = { name: "home", matchId: null };
 const app = () => document.getElementById("app");
+
+// Cache of CS extractor match data keyed by map UUID. Populated lazily when a
+// match screen or dashboard is opened; absence means "not fetched / not yet
+// uploaded by the plugin". Cleared when switching away from a championship.
+let csMatchCache = {};
+let csGlobalStats = null;   // cached per-player records for the global dashboard
+let dashboardLoading = false;
+let dashboardError = null;  // last dashboard fetch error message, or null
 
 const ACTIVE_CREW_KEY = "cs2.activeCrewId";
 function activeCrew() {
@@ -177,6 +187,132 @@ function esc(s) {
   return String(s).replace(/[&<>"]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]));
 }
 
+// Copy text to the clipboard, falling back to a hidden textarea + execCommand
+// when the async Clipboard API is unavailable (insecure context / old browser).
+async function copyToClipboard(text) {
+  try {
+    if (navigator.clipboard && navigator.clipboard.writeText) {
+      await navigator.clipboard.writeText(text);
+      return true;
+    }
+  } catch (e) { /* fall through to legacy path */ }
+  try {
+    const ta = document.createElement("textarea");
+    ta.value = text;
+    ta.style.position = "fixed";
+    ta.style.opacity = "0";
+    document.body.appendChild(ta);
+    ta.select();
+    const ok = document.execCommand("copy");
+    document.body.removeChild(ta);
+    return ok;
+  } catch (e) {
+    return false;
+  }
+}
+
+// ---- CS extractor integration --------------------------------------------
+
+// Every match in the tournament (group round-robins + playoff bracket), flat.
+function allMatches(t) {
+  const out = [];
+  if (!t) return out;
+  for (const g of t.groups || []) for (const m of g.matches || []) out.push(m);
+  for (const round of t.rounds || []) for (const m of round || []) out.push(m);
+  return out;
+}
+
+// All generated map UUIDs across the whole tournament (one per picked map).
+function allMapUuids(t) {
+  const ids = [];
+  for (const m of allMatches(t)) {
+    if (m.veto && m.veto.complete && Array.isArray(m.veto.mapIds)) {
+      for (const id of m.veto.mapIds) if (id) ids.push(id);
+    }
+  }
+  return ids;
+}
+
+// The signed-in user's record in a CS match's players[], or null.
+function csMe(cs) {
+  const uid = user && user.uid;
+  if (!uid || !Array.isArray(cs.players)) return null;
+  return cs.players.find((p) => p.userId === uid) || null;
+}
+
+// The tracked team's (my team's) score/enemy score for a CS match, resolved
+// independently of the CT/T side swap. Prefers the signed-in user's own
+// per-player perspective (correct even if tracked players split teams), then
+// the match-doc's myTeam summary. Returns { mine, theirs } or null.
+function csMyScore(cs) {
+  const me = csMe(cs);
+  if (me && me.teamScore != null && me.enemyScore != null) {
+    return { mine: Number(me.teamScore) || 0, theirs: Number(me.enemyScore) || 0 };
+  }
+  if (cs.myTeam && cs.myTeam.score != null) {
+    return { mine: Number(cs.myTeam.score) || 0, theirs: Number((cs.enemyTeam && cs.enemyTeam.score)) || 0 };
+  }
+  return null;
+}
+
+// My team's starting side ("CT" | "T") for a CS match, or null.
+function csMyStartSide(cs) {
+  const me = csMe(cs);
+  if (me && me.startSide) return String(me.startSide).toUpperCase();
+  if (cs.myTeam && cs.myTeam.startSide) return String(cs.myTeam.startSide).toUpperCase();
+  return null;
+}
+
+// Map a CS match's score onto our Team A / Team B for map `mapIdx` of `match`.
+// Returns { scoreA, scoreB } or null if it can't be mapped.
+//
+// The plugin now resolves "my team" vs "enemy team" scores for us (robust to
+// the halftime side swap), so we assign my-team's score to the user's bracket
+// team. Older match docs predate those fields, so we fall back to mapping the
+// raw score.ct/score.t by the user's CT/T team label, then by starting side.
+function mapCsScore(match, mapIdx, cs) {
+  if (!cs) return null;
+  const userBracketSide = userVetoSide(match);           // "A" | "B" | null
+
+  // Preferred: plugin-resolved my-team / enemy-team scores.
+  const resolved = csMyScore(cs);
+  if (userBracketSide && resolved) {
+    return userBracketSide === "A"
+      ? { scoreA: resolved.mine, scoreB: resolved.theirs }
+      : { scoreA: resolved.theirs, scoreB: resolved.mine };
+  }
+
+  if (!cs.score) return null;
+  const ct = Number(cs.score.ct) || 0;
+  const t = Number(cs.score.t) || 0;
+
+  // Legacy fallback: derive my-team's side from the per-player CT/T label.
+  const me = csMe(cs);
+  const userTeamLabel = me && me.team ? String(me.team).toUpperCase() : null;
+  if (userBracketSide && userTeamLabel) {
+    const mine = userTeamLabel === "CT" ? ct : t;
+    const theirs = userTeamLabel === "CT" ? t : ct;
+    return userBracketSide === "A" ? { scoreA: mine, scoreB: theirs } : { scoreA: theirs, scoreB: mine };
+  }
+  // Last resort: assume score is keyed by Team A's starting side.
+  const sides = match.veto && match.veto.sides && match.veto.sides[mapIdx];
+  if (sides) return sides.sideA === "CT" ? { scoreA: ct, scoreB: t } : { scoreA: t, scoreB: ct };
+  return { scoreA: ct, scoreB: t };
+}
+
+// Pull CS data for every map UUID in a match into the cache, then re-render if
+// the user is still looking at that match. Safe to call repeatedly.
+async function prefetchCsForMatch(matchId) {
+  const m = findMatch(tournament, matchId);
+  if (!m || !m.veto || !m.veto.complete) return;
+  const uuids = (m.veto.mapIds || []).filter(Boolean);
+  if (!uuids.length) return;
+  try {
+    Object.assign(csMatchCache, await getCsMatches(uuids));
+    if (view.name === "match" && view.matchId === matchId) render();
+  } catch (e) { console.error("CS prefetch failed", e); }
+}
+
 // CS2 map icon (from MurkyYT/cs2-map-icons). Falls back to nothing if unknown.
 function mapIconImg(name, size = "h-5 w-5") {
   const src = mapIcon(name);
@@ -196,6 +332,8 @@ function render() {
   if (view.name === "select") return renderSelect();
   if (view.name === "bracket") return renderBracket();
   if (view.name === "match") return renderMatch();
+  if (view.name === "match-info") return renderMatchInfo();
+  if (view.name === "dashboard") return renderDashboard();
   return renderHome();
 }
 
@@ -457,7 +595,11 @@ function renderHome() {
         ${teamSwitcher()}
         ${invitesBanner()}
       </div>
-      <div class="text-center">${createBtn}</div>
+      <div class="text-center flex items-center justify-center gap-3">
+        ${createBtn}
+        <button data-action="dashboard" data-scope="global"
+          class="px-6 py-3 rounded-lg bg-slate-800 hover:bg-slate-700 text-slate-200 transition font-bold shadow-lg">📊 My Stats</button>
+      </div>
       <div class="grid grid-cols-1 lg:grid-cols-2 gap-6 items-start">
         <div class="space-y-6">
           <div class="bg-ink border border-slate-800 rounded-xl p-4 shadow-xl space-y-3">
@@ -680,6 +822,10 @@ function renderBracket() {
 
   shell(`
     ${banner}
+    <div class="flex justify-end mb-3">
+      <button data-action="dashboard" data-scope="championship"
+        class="px-3 py-1.5 rounded-lg bg-slate-800 hover:bg-slate-700 text-slate-200 transition text-sm font-semibold">📊 Player Stats</button>
+    </div>
     ${groupsSection}
     ${playoffSection}`,
     { back: { action: "goto-home", label: "Home" } });
@@ -778,6 +924,20 @@ function vetoPanel(match) {
     </div>`;
 }
 
+// A copyable line showing the unique UUID for a single map match.
+function matchIdLine(match, i) {
+  const id = match.veto.mapIds && match.veto.mapIds[i];
+  if (!id) return "";
+  return `
+    <div class="flex items-center gap-2 text-[10px] text-slate-500 font-mono">
+      <span class="uppercase tracking-wide not-italic text-slate-600">Match ID</span>
+      <span class="truncate" title="${esc(id)}">${esc(id)}</span>
+      <button data-action="copy-match-id" data-id="${esc(id)}"
+        class="px-1.5 py-0.5 rounded bg-slate-800 hover:bg-slate-700 text-slate-300 transition shrink-0"
+        title="Copy match ID">Copy</button>
+    </div>`;
+}
+
 function mapsPanel(match) {
   if (!match.veto || !match.veto.complete) return "";
   const a = match.teamA, b = match.teamB;
@@ -787,18 +947,30 @@ function mapsPanel(match) {
     const played = match.mapsPlayed[i];
     const isNext = !played && i === playedCount && match.status !== "finished";
     const sides = (match.veto.sides && match.veto.sides[i]) || null;
+    const uuid = match.veto.mapIds && match.veto.mapIds[i];
+    const hasCs = uuid && csMatchCache[uuid];
     if (played) {
       const aWon = played.winnerId === a.id;
+      const details = hasCs
+        ? `<button data-action="match-info" data-match="${match.id}" data-mapidx="${i}"
+            class="px-1.5 py-0.5 rounded bg-accent/20 text-accent hover:bg-accent/30 transition text-[10px] font-semibold shrink-0">Details</button>`
+        : "";
       return `
-        <div class="flex items-center justify-between rounded bg-slate-900/60 border border-slate-800 px-3 py-2">
-          <span class="flex items-center gap-2 text-sm font-medium">${mapIconImg(mapName, "h-6 w-6")}${esc(mapName)}</span>
-          <span class="flex items-center gap-2 text-sm font-mono">
-            ${sideBadge(played.sideA)}
-            <span class="${aWon ? "text-emerald-400 font-bold" : "text-slate-400"}">${played.scoreA}</span>
-            <span class="text-slate-600">:</span>
-            <span class="${!aWon ? "text-emerald-400 font-bold" : "text-slate-400"}">${played.scoreB}</span>
-            ${sideBadge(played.sideB)}
-          </span>
+        <div class="rounded bg-slate-900/60 border border-slate-800 px-3 py-2 space-y-1">
+          <div class="flex items-center justify-between">
+            <span class="flex items-center gap-2 text-sm font-medium">${mapIconImg(mapName, "h-6 w-6")}${esc(mapName)}</span>
+            <span class="flex items-center gap-2 text-sm font-mono">
+              ${sideBadge(played.sideA)}
+              <span class="${aWon ? "text-emerald-400 font-bold" : "text-slate-400"}">${played.scoreA}</span>
+              <span class="text-slate-600">:</span>
+              <span class="${!aWon ? "text-emerald-400 font-bold" : "text-slate-400"}">${played.scoreB}</span>
+              ${sideBadge(played.sideB)}
+            </span>
+          </div>
+          <div class="flex items-center justify-between gap-2">
+            ${matchIdLine(match, i)}
+            ${details}
+          </div>
         </div>`;
     }
     if (isNext) {
@@ -823,6 +995,21 @@ function mapsPanel(match) {
             <button data-action="save-score" data-match="${match.id}" data-map="${esc(mapName)}"
               class="px-3 py-1 rounded bg-emerald-600 hover:bg-emerald-500 transition text-sm">Enter Score</button>
           </div>`;
+      let importBox = "";
+      if (hasCs) {
+        // Preview the score exactly as it will be recorded (Team A : Team B).
+        const cs = csMatchCache[uuid];
+        const mapped = mapCsScore(match, i, cs);
+        const preview = mapped
+          ? `${esc(a.tag)} <span class="font-mono font-bold">${mapped.scoreA}:${mapped.scoreB}</span> ${esc(b.tag)}`
+          : `<span class="font-mono font-bold">${Number(cs.score?.ct) || 0}:${Number(cs.score?.t) || 0}</span>`;
+        importBox = `
+          <div class="rounded-md bg-accent/10 border border-accent/40 px-3 py-2 flex items-center justify-between gap-2">
+            <span class="text-[11px] text-accent">📥 CS result uploaded — ${preview} on ${esc(cs.map || mapName)}</span>
+            <button data-action="import-result" data-match="${match.id}" data-mapidx="${i}"
+              class="px-3 py-1 rounded bg-accent text-ink font-bold text-xs shrink-0 hover:brightness-110 transition">Import result</button>
+          </div>`;
+      }
       return `
         <div data-maprow class="rounded bg-slate-900/60 border border-yellow-500/40 px-3 py-2 space-y-2">
           <div class="flex items-center justify-between">
@@ -830,15 +1017,20 @@ function mapsPanel(match) {
               <span class="text-yellow-500 text-xs">· next map</span></span>
             ${sides ? `<span class="text-[10px] text-slate-500">${esc(a.tag)} ${sideBadge(sides.sideA)} · ${sideBadge(sides.sideB)} ${esc(b.tag)}</span>` : ""}
           </div>
+          ${importBox}
           ${body}
+          ${matchIdLine(match, i)}
         </div>`;
     }
     return `
-      <div class="flex items-center justify-between rounded bg-slate-900/30 border border-slate-800/60 px-3 py-2 opacity-50">
-        <span class="flex items-center gap-2 text-sm">${mapIconImg(mapName, "h-6 w-6")}${esc(mapName)}</span>
-        ${sides
-          ? `<span class="flex items-center gap-1 text-[10px]">${esc(a.tag)} ${sideBadge(sides.sideA)} · ${sideBadge(sides.sideB)} ${esc(b.tag)}</span>`
-          : '<span class="text-xs text-slate-600">locked</span>'}
+      <div class="rounded bg-slate-900/30 border border-slate-800/60 px-3 py-2 space-y-1 opacity-50">
+        <div class="flex items-center justify-between">
+          <span class="flex items-center gap-2 text-sm">${mapIconImg(mapName, "h-6 w-6")}${esc(mapName)}</span>
+          ${sides
+            ? `<span class="flex items-center gap-1 text-[10px]">${esc(a.tag)} ${sideBadge(sides.sideA)} · ${sideBadge(sides.sideB)} ${esc(b.tag)}</span>`
+            : '<span class="text-xs text-slate-600">locked</span>'}
+        </div>
+        ${matchIdLine(match, i)}
       </div>`;
   }).join("");
 
@@ -888,6 +1080,267 @@ function renderMatch() {
       <div class="order-3">${teamPanel(match.teamB, match)}</div>
     </div>`,
     { back: { action: "goto-bracket", label: "Bracket" } });
+}
+
+// ---- CS match info & player dashboards ------------------------------------
+
+const csNum = (v) => Number(v) || 0;
+
+// Normalize a player record (from a match's players[] OR a player_match doc)
+// into the flat shape the scoreboard and aggregation use.
+function csPlayerRow(p) {
+  const adv = p.advanced || {};
+  return {
+    key: p.userId || p.nickname || "?",
+    nickname: p.nickname || p.userId || "Unknown",
+    team: (p.team || "").toUpperCase(),
+    kills: csNum(p.kills),
+    deaths: csNum(p.deaths),
+    assists: csNum(p.assists),
+    hsKills: csNum(p.headshotKills),
+    mvps: csNum(p.mvps),
+    score: csNum(p.score),
+    rounds: csNum(adv.roundsPlayed) || csNum(p.roundsPlayed) || csNum(p.totalRounds),
+    kastRounds: csNum(adv.kastRounds),
+    adr: csNum(adv.adr),
+    kast: csNum(adv.kast),
+    hsPct: csNum(adv.headshotPercent),
+  };
+}
+
+// Aggregate many per-match player rows into one row per player, recomputing
+// rate stats (ADR/KAST/HS%) precisely from the underlying totals.
+function aggregatePlayers(rows) {
+  const byKey = new Map();
+  for (const r of rows) {
+    let g = byKey.get(r.key);
+    if (!g) { g = { key: r.key, nickname: r.nickname, matches: 0, kills: 0, deaths: 0, assists: 0, hsKills: 0, mvps: 0, rounds: 0, adrSum: 0, kastRounds: 0 }; byKey.set(r.key, g); }
+    if (r.nickname) g.nickname = r.nickname;
+    g.matches += 1;
+    g.kills += r.kills; g.deaths += r.deaths; g.assists += r.assists;
+    g.hsKills += r.hsKills; g.mvps += r.mvps; g.rounds += r.rounds;
+    g.adrSum += r.adr * r.rounds;      // round-weighted so the average is exact
+    g.kastRounds += r.kastRounds;
+  }
+  return [...byKey.values()].map((g) => ({
+    ...g,
+    kd: g.deaths ? g.kills / g.deaths : g.kills,
+    adr: g.rounds ? g.adrSum / g.rounds : 0,
+    kast: g.rounds ? (g.kastRounds / g.rounds) * 100 : 0,
+    hsPct: g.kills ? (g.hsKills / g.kills) * 100 : 0,
+  })).sort((a, b) => (b.kd - a.kd) || (b.kills - a.kills));
+}
+
+function fmtDuration(secs) {
+  const s = csNum(secs);
+  if (!s) return "—";
+  const m = Math.floor(s / 60);
+  return `${m}:${String(s % 60).padStart(2, "0")}`;
+}
+
+function fmtCsDate(v) {
+  if (!v) return "";
+  let ms = 0;
+  if (typeof v === "number") ms = v;
+  else if (typeof v.toMillis === "function") ms = v.toMillis();
+  else if (v.seconds != null) ms = v.seconds * 1000;
+  else ms = new Date(v).getTime();
+  if (!ms || isNaN(ms)) return "";
+  try { return new Date(ms).toLocaleString(); } catch { return ""; }
+}
+
+// One round-by-round strip colored by the winning side (CT blue / T amber).
+function roundStrip(rounds) {
+  if (!Array.isArray(rounds) || !rounds.length) return "";
+  const cells = rounds.map((r) => {
+    const ct = String(r.winnerSide).toUpperCase() === "CT";
+    const cls = ct ? "bg-sky-500/70" : "bg-amber-500/70";
+    return `<span class="inline-block w-3 h-5 rounded-sm ${cls}" title="Round ${csNum(r.round)} · ${esc(r.winnerSide || "")}"></span>`;
+  }).join("");
+  return `<div class="flex flex-wrap gap-1">${cells}</div>`;
+}
+
+// The detailed scoreboard for one extracted CS match.
+function csScoreboard(cs) {
+  const rows = (cs.players || []).map(csPlayerRow).sort((a, b) => (b.kills - a.kills));
+  const body = rows.map((p) => `
+    <tr class="border-t border-slate-800">
+      <td class="py-1.5 pr-2 font-medium">${esc(p.nickname)} ${p.team ? sideBadge(p.team) : ""}</td>
+      <td class="px-2 text-center font-mono">${p.kills}</td>
+      <td class="px-2 text-center font-mono">${p.deaths}</td>
+      <td class="px-2 text-center font-mono">${p.assists}</td>
+      <td class="px-2 text-center font-mono">${p.deaths ? (p.kills / p.deaths).toFixed(2) : p.kills.toFixed(2)}</td>
+      <td class="px-2 text-center font-mono">${p.adr.toFixed(1)}</td>
+      <td class="px-2 text-center font-mono">${p.hsPct.toFixed(0)}%</td>
+      <td class="px-2 text-center font-mono">${p.kast.toFixed(0)}%</td>
+      <td class="px-2 text-center font-mono">${p.mvps}</td>
+    </tr>`).join("");
+  return `
+    <div class="overflow-x-auto">
+      <table class="w-full text-xs">
+        <thead class="text-slate-500 uppercase tracking-wide text-[10px]">
+          <tr>
+            <th class="py-1 pr-2 text-left">Player</th>
+            <th class="px-2">K</th><th class="px-2">D</th><th class="px-2">A</th>
+            <th class="px-2">K/D</th><th class="px-2">ADR</th><th class="px-2">HS%</th>
+            <th class="px-2">KAST</th><th class="px-2">MVP</th>
+          </tr>
+        </thead>
+        <tbody>${body}</tbody>
+      </table>
+    </div>`;
+}
+
+function renderMatchInfo() {
+  const match = findMatch(tournament, view.matchId);
+  if (!match) { view = { name: "bracket" }; return render(); }
+  const i = view.mapIdx;
+  const uuid = match.veto && match.veto.mapIds && match.veto.mapIds[i];
+  const cs = uuid && csMatchCache[uuid];
+  const mapName = (match.veto && match.veto.picked && match.veto.picked[i]) || (cs && cs.map) || "Map";
+
+  const back = { action: "goto-match", label: "Match" };
+  if (!cs) {
+    shell(`
+      <div class="max-w-2xl mx-auto bg-panel rounded-xl p-6 border border-slate-800 text-center text-slate-400">
+        No CS data found for this map yet. The plugin uploads it after the match ends.
+        <div class="mt-3 font-mono text-[10px] text-slate-600">${esc(uuid || "")}</div>
+      </div>`, { back });
+    return;
+  }
+
+  const ct = csNum(cs.score && cs.score.ct), t = csNum(cs.score && cs.score.t);
+  const winner = String(cs.winner || "").toUpperCase();
+  const meta = [
+    cs.map ? esc(cs.map) : "",
+    `${fmtDuration(cs.durationSeconds)} min`,
+    fmtCsDate(cs.endedAtUtc),
+    cs.serverHostname ? `srv: ${esc(cs.serverHostname)}` : "",
+  ].filter(Boolean).join(" · ");
+
+  shell(`
+    <div class="max-w-3xl mx-auto space-y-4">
+      <div class="bg-panel rounded-xl p-5 border border-slate-800 text-center">
+        <div class="flex items-center justify-center gap-2 text-sm font-bold">${mapIconImg(mapName, "h-7 w-7")}${esc(mapName)}</div>
+        <div class="text-3xl font-black mt-2 font-mono">
+          <span class="${winner === "CT" ? "text-emerald-400" : "text-slate-300"}">${ct}</span>
+          <span class="text-slate-600">:</span>
+          <span class="${winner === "T" ? "text-emerald-400" : "text-slate-300"}">${t}</span>
+        </div>
+        <div class="text-[11px] uppercase tracking-wide text-slate-500 mt-1">
+          ${sideBadge("CT")} <span class="text-slate-600">vs</span> ${sideBadge("T")} · winner ${winner ? sideBadge(winner) : "—"}
+        </div>
+        <div class="text-[11px] text-slate-500 mt-2">${meta}</div>
+        <div class="mt-3 flex justify-center">${roundStrip(cs.rounds)}</div>
+      </div>
+      <div class="bg-panel rounded-xl p-4 border border-slate-800">
+        <div class="text-xs uppercase tracking-wide text-slate-500 mb-2">Scoreboard</div>
+        ${csScoreboard(cs)}
+      </div>
+      <div class="font-mono text-[10px] text-slate-600 text-center">${esc(uuid)}</div>
+    </div>`, { back });
+}
+
+// Leaderboard table shared by both dashboard scopes.
+function dashboardTable(players) {
+  if (!players.length) {
+    return `<p class="text-slate-500 text-sm">No CS match data yet. Play a map with its Match ID and your plugin's upload will appear here.</p>`;
+  }
+  const body = players.map((p, idx) => `
+    <tr class="border-t border-slate-800">
+      <td class="py-1.5 pr-2 text-slate-500 text-center">${idx + 1}</td>
+      <td class="py-1.5 pr-2 font-medium">${esc(p.nickname)}</td>
+      <td class="px-2 text-center font-mono">${p.matches}</td>
+      <td class="px-2 text-center font-mono">${p.kills}</td>
+      <td class="px-2 text-center font-mono">${p.deaths}</td>
+      <td class="px-2 text-center font-mono">${p.assists}</td>
+      <td class="px-2 text-center font-mono font-bold ${p.kd >= 1 ? "text-emerald-400" : "text-slate-300"}">${p.kd.toFixed(2)}</td>
+      <td class="px-2 text-center font-mono">${p.adr.toFixed(1)}</td>
+      <td class="px-2 text-center font-mono">${p.hsPct.toFixed(0)}%</td>
+      <td class="px-2 text-center font-mono">${p.kast.toFixed(0)}%</td>
+      <td class="px-2 text-center font-mono">${p.mvps}</td>
+    </tr>`).join("");
+  // Hover tooltips explaining each column. `extra` adds left-alignment etc.
+  const th = (label, tip, extra = "px-2") =>
+    `<th class="${extra}"><span class="cursor-help border-b border-dotted border-slate-600" title="${esc(tip)}">${label}</span></th>`;
+  return `
+    <div class="overflow-x-auto">
+      <table class="w-full text-xs">
+        <thead class="text-slate-500 uppercase tracking-wide text-[10px]">
+          <tr>
+            <th class="py-1 pr-2">#</th>
+            ${th("Player", "In-game player nickname.", "py-1 pr-2 text-left")}
+            ${th("M", "Matches — number of maps with uploaded CS data counted for this player.")}
+            ${th("K", "Kills — total enemy kills across all counted maps.")}
+            ${th("D", "Deaths — total times this player died.")}
+            ${th("A", "Assists — total kills this player helped secure (damage or flash assists).")}
+            ${th("K/D", "Kill/Death ratio — total kills divided by total deaths. Above 1.00 means more kills than deaths.")}
+            ${th("ADR", "Average Damage per Round — total damage dealt divided by rounds played (round-weighted across maps). ~85+ is strong.")}
+            ${th("HS%", "Headshot percentage — share of this player's kills that were headshots.")}
+            ${th("KAST", "Share of rounds with a Kill, Assist, Survived, or was Traded — a consistency/impact measure. ~70%+ is good.")}
+            ${th("MVP", "Most Valuable Player awards — rounds where this player had the biggest impact.")}
+          </tr>
+        </thead>
+        <tbody>${body}</tbody>
+      </table>
+    </div>`;
+}
+
+function renderDashboard() {
+  const scope = view.scope === "global" ? "global" : "championship";
+  const canChampionship = !!tournament;
+
+  const tab = (key, label, enabled) => {
+    const active = scope === key;
+    if (!enabled) return "";
+    return `<button data-action="dashboard" data-scope="${key}"
+      class="px-3 py-1.5 rounded-lg text-sm font-semibold transition ${active ? "bg-accent text-ink" : "bg-slate-800 text-slate-300 hover:bg-slate-700"}">${esc(label)}</button>`;
+  };
+
+  let table, subtitle;
+  if (scope === "championship") {
+    const uuids = new Set(allMapUuids(tournament));
+    const rows = [];
+    for (const id of uuids) {
+      const cs = csMatchCache[id];
+      if (cs && Array.isArray(cs.players)) rows.push(...cs.players.map(csPlayerRow));
+    }
+    table = dashboardTable(aggregatePlayers(rows));
+    subtitle = `${esc(championshipName || "Championship")} · players across all maps with uploaded CS data`;
+  } else {
+    const rows = (csGlobalStats || []).map(csPlayerRow);
+    table = dashboardTable(aggregatePlayers(rows));
+    subtitle = "Your all-time stats across every championship";
+  }
+
+  if (dashboardLoading) {
+    table = `<p class="text-slate-400 text-sm">Loading stats…</p>`;
+  } else if (dashboardError) {
+    table = `
+      <div class="rounded-lg bg-red-500/10 border border-red-500/40 p-3 text-sm text-red-300 space-y-1">
+        <div class="font-semibold">Couldn't load CS stats.</div>
+        <div class="text-red-300/80 font-mono text-xs break-all">${esc(dashboardError)}</div>
+        <div class="text-slate-400 text-xs">If this says <span class="font-mono">permission-denied</span>, the Firestore rules granting read access to the CS extractor collections aren't deployed yet — run <span class="font-mono">npm run deploy:rules</span>.</div>
+      </div>`;
+  }
+
+  // Back target depends on where the user came from.
+  const back = tournament ? { action: "goto-bracket", label: "Bracket" } : { action: "goto-home", label: "Home" };
+
+  shell(`
+    <div class="max-w-4xl mx-auto space-y-4">
+      <div class="flex items-center gap-2">
+        ${tab("championship", "This Championship", canChampionship)}
+        ${tab("global", "All-time (me)", true)}
+      </div>
+      <div class="bg-panel rounded-xl p-4 border border-slate-800 space-y-3">
+        <div>
+          <div class="text-sm font-bold">Player Dashboard</div>
+          <div class="text-xs text-slate-500">${subtitle}</div>
+        </div>
+        ${table}
+      </div>
+    </div>`, { back });
 }
 
 // ---- Actions / events -----------------------------------------------------
@@ -1133,7 +1586,83 @@ async function onClick(e) {
 
     case "open-match":
       view = { name: "match", matchId };
+      render();
+      prefetchCsForMatch(matchId);   // fill in any uploaded CS results, then re-render
+      return;
+
+    case "match-info":
+      view = { name: "match-info", matchId, mapIdx: parseInt(el.dataset.mapidx, 10) };
       return render();
+
+    case "goto-match": {
+      const id = matchId || view.matchId;
+      view = { name: "match", matchId: id };
+      render();
+      prefetchCsForMatch(id);
+      return;
+    }
+
+    case "dashboard": {
+      const scope = el.dataset.scope === "global" ? "global" : "championship";
+      view = { name: "dashboard", scope };
+      dashboardError = null;
+      dashboardLoading = true;
+      render();
+      try {
+        if (scope === "championship" && tournament) {
+          Object.assign(csMatchCache, await getCsMatches(allMapUuids(tournament)));
+        } else if (scope === "global" && user) {
+          csGlobalStats = await getCsPlayerMatchesByUser(user.uid);
+        }
+      } catch (e) {
+        console.error("dashboard load failed", e);
+        dashboardError = (e && (e.code || e.message)) ? `${e.code || ""} ${e.message || ""}`.trim() : "Failed to load stats.";
+      } finally {
+        dashboardLoading = false;
+      }
+      if (view.name === "dashboard" && view.scope === scope) render();
+      return;
+    }
+
+    case "import-result": {
+      const idx = parseInt(el.dataset.mapidx, 10);
+      const m = findMatch(tournament, matchId);
+      const uuid = m && m.veto && m.veto.mapIds && m.veto.mapIds[idx];
+      const cs = uuid && csMatchCache[uuid];
+      if (!cs) { await alertDialog({ title: "No result", message: "No CS data is available for this map yet." }); return; }
+      const mapped = mapCsScore(m, idx, cs);
+      if (!mapped || mapped.scoreA === mapped.scoreB) {
+        await alertDialog({ title: "Can't import", message: "The CS result couldn't be mapped to a clear winner. Enter the score manually." });
+        return;
+      }
+      await update((t) => {
+        const mm = findMatch(t, matchId);
+        // If the user still owed a side choice for this map, adopt the real
+        // starting side from the CS data so the badges match what was played.
+        if (mm.veto && mm.veto.sides && !mm.veto.sides[idx]) {
+          const userStart = csMyStartSide(cs);
+          if (userStart) {
+            const userIsA = userVetoSide(mm) === "A";
+            const sideA = userIsA ? userStart : (userStart === "CT" ? "T" : "CT");
+            mm.veto.sides[idx] = { sideA, sideB: sideA === "CT" ? "T" : "CT" };
+          }
+        }
+        const done = recordMap(mm, mm.veto.picked[idx], mapped.scoreA, mapped.scoreB);
+        if (done) { advanceWinner(t, mm); resolveAiMatches(t); }
+      }, "Importing match result…");
+      maybeGrantChampionReward();
+      return;
+    }
+
+    case "copy-match-id": {
+      const id = el.dataset.id;
+      if (!id) return;
+      const ok = await copyToClipboard(id);
+      const original = el.textContent;
+      el.textContent = ok ? "Copied!" : "Failed";
+      setTimeout(() => { el.textContent = original; }, 1200);
+      return;
+    }
 
     case "start-veto":
       return update((t) => {

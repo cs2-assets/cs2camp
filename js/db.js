@@ -22,9 +22,17 @@ import {
   deleteDoc,
   query,
   where,
+  limit,
 } from "firebase/firestore";
 
 const COLLECTION = "championships";
+
+// Collections written by the external CS2 extractor plugin (read-only here).
+// `cs_extractor_match` holds one document per played map keyed by `matchUuid`
+// (the per-map UUID we generate); `cs_extractor_player_match` holds one
+// denormalized per-player record per match, doc id `${userId}_${matchUuid}`.
+const CS_MATCH_COLLECTION = "cs_extractor_match";
+const CS_PLAYER_MATCH_COLLECTION = "cs_extractor_player_match";
 
 // Kept for API compatibility with the previous IndexedDB layer. The Firestore
 // SDK needs no explicit open step, so there is nothing to initialize here.
@@ -124,6 +132,59 @@ export async function loadChampionship(id) {
 export async function deleteChampionship(id) {
   await deleteDoc(doc(db, COLLECTION, id));
   return true;
+}
+
+// ---- CS extractor reads ---------------------------------------------------
+
+// Fetch the extracted CS match for a single map UUID, or null if the plugin
+// hasn't uploaded it yet.
+export async function getCsMatch(matchUuid) {
+  if (!matchUuid) return null;
+  const snap = await getDocs(
+    query(collection(db, CS_MATCH_COLLECTION), where("matchUuid", "==", matchUuid), limit(1))
+  );
+  return snap.empty ? null : snap.docs[0].data();
+}
+
+// Fetch every uploaded CS match for the given map UUIDs. Returns a map of
+// matchUuid -> match data (UUIDs with no upload yet are simply absent).
+// Firestore "in" filters take at most 10 values, so we query in chunks.
+export async function getCsMatches(matchUuids) {
+  const ids = [...new Set((matchUuids || []).filter(Boolean))];
+  const out = {};
+  for (let i = 0; i < ids.length; i += 10) {
+    const chunk = ids.slice(i, i + 10);
+    const snap = await getDocs(
+      query(collection(db, CS_MATCH_COLLECTION), where("matchUuid", "in", chunk))
+    );
+    snap.forEach((d) => {
+      const data = d.data();
+      if (data && data.matchUuid) out[data.matchUuid] = data;
+    });
+  }
+  return out;
+}
+
+// Every per-player match record for a single user across all championships.
+// Used by the global all-time dashboard. Sorted newest-first client-side.
+export async function getCsPlayerMatchesByUser(uid) {
+  if (!uid) return [];
+  const snap = await getDocs(
+    query(collection(db, CS_PLAYER_MATCH_COLLECTION), where("userId", "==", uid))
+  );
+  return snap.docs
+    .map((d) => d.data())
+    .sort((a, b) => (toMillis(b.endedAtUtc) || 0) - (toMillis(a.endedAtUtc) || 0));
+}
+
+// Firestore Timestamp | millis | Date -> millis (best-effort, 0 if unknown).
+function toMillis(v) {
+  if (!v) return 0;
+  if (typeof v === "number") return v;
+  if (typeof v.toMillis === "function") return v.toMillis();
+  if (v.seconds != null) return v.seconds * 1000;
+  const t = new Date(v).getTime();
+  return isNaN(t) ? 0 : t;
 }
 
 // Write a championship using a caller-supplied id and timestamps, overwriting

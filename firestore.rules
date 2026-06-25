@@ -94,6 +94,20 @@ service cloud.firestore {
       allow delete: if signedIn() && myUid() in existing().memberUids;
     }
 
+    // ---- CS match data (written by the external CS2 extractor plugin) ----
+    // Read-only from this app: the plugin uploads match + per-player stats keyed
+    // by the per-map matchUuid we generate. Any signed-in user may read them so
+    // the organizer can import scores and render dashboards. Writes are reserved
+    // for the plugin (service account / admin), never the web client.
+    match /cs_extractor_match/{matchId} {
+      allow read: if signedIn();
+      allow write: if false;
+    }
+    match /cs_extractor_player_match/{docId} {
+      allow read: if signedIn();
+      allow write: if false;
+    }
+
     // Everything else is denied by default.
     match /{document=**} {
       allow read, write: if false;
