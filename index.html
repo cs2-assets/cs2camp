@@ -37,7 +37,9 @@
 
 <body class="bg-ink text-slate-100 min-h-screen antialiased">
   <div id="app" class="min-h-screen"></div>
-  <script type="module" src="js/app.js"></script>
+  <!-- The app bundle is injected automatically by HtmlWebpackPlugin (see
+       webpack.common.js). Do not add the app script tag here, or it loads
+       and runs twice (double event handlers, double dialogs). -->
 </body>
 
 </html>
