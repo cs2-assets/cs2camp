@@ -7,6 +7,7 @@
 
 import { initializeApp } from "firebase/app";
 import { getFirestore } from "firebase/firestore";
+import { getAuth } from "firebase/auth";
 
 const firebaseConfig = {
   apiKey: "AIzaSyAMCf9GMHC3O2OIx3O29QKLkAsWPQ9F9_M",
@@ -23,3 +24,4 @@ export const FIRESTORE_DATABASE_ID = "chemist-site";
 
 export const app = initializeApp(firebaseConfig);
 export const db = getFirestore(app, FIRESTORE_DATABASE_ID);
+export const auth = getAuth(app);

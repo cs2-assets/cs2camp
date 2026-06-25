@@ -25,20 +25,40 @@ import {
   STAGE_LABELS,
 } from "./engine.js";
 import { createVeto, currentAction, applyVeto, autoVetoOpponent, userOptions, chooseSide, needsUserSide, PICK_COUNT, BAN_COUNT } from "./veto.js";
-import { migrateIndexedDBToFirestore } from "./migrate.js";
 import { confirmDialog } from "./dialog.js";
 import { withLoading, setSaving } from "./loading.js";
 import { getMapOrder, setMapOrder, clearMapOrder } from "./prefs.js";
+import { onAuth, signInWithGoogle, signOutUser } from "./auth.js";
+import {
+  createCrew,
+  listMyCrews,
+  listMyInvites,
+  inviteEmail,
+  revokeInvite,
+  acceptInvite,
+  removeMember,
+  leaveCrew,
+  syncCrewMembership,
+} from "./crews.js";
 import Sortable from "sortablejs";
 
 // ---- State ---------------------------------------------------------------
 
+let user = null;             // signed-in Firebase user (null when logged out)
+let crews = [];              // Teams the user belongs to
+let invites = [];            // pending Team invites (by email)
+let activeCrewId = null;     // currently selected Team
 let tournament = null;       // active in-memory Tournament snapshot
 let championshipId = null;   // id of the active saved championship record
 let championshipName = "";    // its display name
 let championships = [];        // metadata list shown on the home screen
 let view = { name: "home", matchId: null };
 const app = () => document.getElementById("app");
+
+const ACTIVE_CREW_KEY = "cs2.activeCrewId";
+function activeCrew() {
+  return crews.find((c) => c.id === activeCrewId) || null;
+}
 
 async function save({ silent = false } = {}) {
   if (tournament && championshipId) {
@@ -50,9 +70,27 @@ async function save({ silent = false } = {}) {
   }
 }
 
+// Load every championship the user can access (one array-contains query), then
+// keep only the active Team's for display. `champRows()` reads `championships`.
+let allChampionships = [];
 async function refreshChampionships() {
-  try { championships = await listChampionships(); }
-  catch (e) { console.error("list failed", e); championships = []; }
+  try { allChampionships = user ? await listChampionships(user.uid) : []; }
+  catch (e) { console.error("list failed", e); allChampionships = []; }
+  championships = activeCrewId
+    ? allChampionships.filter((c) => c.crewId === activeCrewId)
+    : [];
+}
+
+// Reload the user's Teams and pending invites; reconcile the active selection.
+async function refreshCrews() {
+  try { crews = user ? await listMyCrews() : []; }
+  catch (e) { console.error("crews list failed", e); crews = []; }
+  try { invites = user ? await listMyInvites() : []; }
+  catch (e) { console.error("invites list failed", e); invites = []; }
+  const saved = (() => { try { return localStorage.getItem(ACTIVE_CREW_KEY); } catch { return null; } })();
+  if (saved && crews.some((c) => c.id === saved)) activeCrewId = saved;
+  else if (!crews.some((c) => c.id === activeCrewId)) activeCrewId = crews.length ? crews[0].id : null;
+  try { if (activeCrewId) localStorage.setItem(ACTIVE_CREW_KEY, activeCrewId); } catch { /* ignore */ }
 }
 
 // Central mutate-then-persist-then-render helper. Pass `loadingMessage` to show
@@ -130,11 +168,27 @@ function mapIconImg(name, size = "h-5 w-5") {
 // ---- Render dispatcher ----------------------------------------------------
 
 function render() {
+  if (!user) return renderSignIn();
+  if (view.name === "new-crew") return renderNewCrew();
   if (view.name === "name") return renderName();
   if (view.name === "select") return renderSelect();
   if (view.name === "bracket") return renderBracket();
   if (view.name === "match") return renderMatch();
   return renderHome();
+}
+
+// Signed-in user chip + sign-out, shown in the header. Empty when logged out.
+function userChip() {
+  if (!user) return "";
+  const photo = user.photoURL
+    ? `<img src="${esc(user.photoURL)}" referrerpolicy="no-referrer" alt="" class="h-7 w-7 rounded-full shrink-0" />`
+    : `<div class="h-7 w-7 rounded-full bg-slate-700 grid place-items-center text-xs font-bold shrink-0">${esc((user.displayName || user.email || "?").slice(0, 1).toUpperCase())}</div>`;
+  return `
+    <div class="flex items-center gap-2 min-w-0">
+      ${photo}
+      <span class="text-sm text-slate-300 hidden sm:inline truncate max-w-[10rem]">${esc(user.displayName || user.email || "Account")}</span>
+      <button data-action="sign-out" class="text-xs text-slate-500 hover:text-red-400 transition shrink-0">Sign out</button>
+    </div>`;
 }
 
 function shell(inner, opts = {}) {
@@ -154,7 +208,10 @@ function shell(inner, opts = {}) {
             <span class="text-accent">CS2</span> Championship Organizer
           </h1>
         </div>
-        ${reset}
+        <div class="flex items-center gap-3 shrink-0">
+          ${reset}
+          ${userChip()}
+        </div>
       </header>
       ${inner}
     </div>`;
@@ -229,26 +286,152 @@ function initMapSort() {
   });
 }
 
-function renderHome() {
-  const list = championships.length
-    ? championships.map(championshipRow).join("")
-    : `<p class="text-slate-500 text-sm">No saved championships yet — create your first one.</p>`;
-
-  shell(`
+// Full-screen background used on the signed-out and home screens.
+function bgLayer() {
+  return `
     <div class="fixed inset-0 -z-10 bg-cover bg-center"
       style="background-image:linear-gradient(to bottom, rgba(11,17,32,0.55), rgba(11,17,32,0.8)), url('img/bg/bg2.jpg')"></div>
     <div class="fixed bottom-2 right-3 -z-10 text-[10px] text-slate-400/70 select-none">
-      Counter-Strike © Valve</div>
-    <div class="max-w-5xl mx-auto space-y-8">
-      <div class="text-center">
-        <button data-action="new"
-          class="px-6 py-3 rounded-lg bg-accent text-ink hover:brightness-110 transition font-bold shadow-lg">
-          + Create</button>
+      Counter-Strike © Valve</div>`;
+}
+
+// Signed-out screen: the only thing available before authenticating.
+function renderSignIn() {
+  app().innerHTML = `
+    ${bgLayer()}
+    <div class="min-h-screen grid place-items-center px-4">
+      <div class="bg-ink border border-slate-800 rounded-2xl p-8 shadow-2xl text-center space-y-5 max-w-sm w-full">
+        <h1 class="text-2xl font-black tracking-tight">
+          <span class="text-accent">CS2</span> Championship Organizer</h1>
+        <p class="text-sm text-slate-400">Sign in to create teams, run championships, and collaborate with your friends.</p>
+        <button data-action="sign-in"
+          class="w-full px-4 py-3 rounded-lg bg-white text-slate-900 font-semibold hover:brightness-95 transition flex items-center justify-center gap-2">
+          <svg class="h-5 w-5" viewBox="0 0 48 48" aria-hidden="true"><path fill="#EA4335" d="M24 9.5c3.5 0 6.6 1.2 9.1 3.6l6.8-6.8C35.9 2.4 30.4 0 24 0 14.6 0 6.4 5.4 2.5 13.3l7.9 6.1C12.2 13.7 17.6 9.5 24 9.5z"/><path fill="#4285F4" d="M46.5 24.5c0-1.6-.1-3.1-.4-4.5H24v9h12.7c-.5 3-2.2 5.5-4.7 7.2l7.3 5.7c4.3-3.9 6.8-9.8 6.8-17.4z"/><path fill="#FBBC05" d="M10.4 28.6c-.5-1.5-.8-3-.8-4.6s.3-3.1.8-4.6l-7.9-6.1C.9 16.5 0 20.1 0 24s.9 7.5 2.5 10.7l7.9-6.1z"/><path fill="#34A853" d="M24 48c6.5 0 11.9-2.1 15.9-5.8l-7.3-5.7c-2 1.4-4.6 2.3-8.6 2.3-6.4 0-11.8-4.2-13.6-9.9l-7.9 6.1C6.4 42.6 14.6 48 24 48z"/></svg>
+          Sign in with Google</button>
       </div>
+    </div>`;
+}
+
+// Inline "name a new team" screen (mirrors renderName).
+function renderNewCrew() {
+  shell(`
+    ${bgLayer()}
+    <div class="max-w-md mx-auto space-y-4 pt-6">
+      <div class="bg-ink border border-slate-800 rounded-xl p-5 shadow-xl space-y-4">
+        <div>
+          <div class="text-xs uppercase tracking-wide text-slate-500">New team</div>
+          <p class="text-sm text-slate-400">Name your team. You can invite friends after creating it.</p>
+        </div>
+        <input data-crew-input type="text" placeholder="e.g. The Squad" maxlength="40"
+          class="w-full bg-slate-800 rounded-lg px-3 py-2 text-sm" />
+        <div class="flex justify-end gap-2">
+          <button data-action="goto-home" class="px-4 py-2 rounded-lg bg-slate-700 hover:bg-slate-600 transition text-sm">Cancel</button>
+          <button data-action="crew-submit" class="px-4 py-2 rounded-lg bg-accent text-ink font-bold text-sm">Create team</button>
+        </div>
+      </div>
+    </div>`, { back: { action: "goto-home", label: "Home" } });
+  const input = document.querySelector("[data-crew-input]");
+  if (input) input.focus();
+}
+
+function shortUid(u) {
+  return u ? `Member ${esc(String(u).slice(0, 5))}` : "Member";
+}
+
+// Team selector pills + "new team".
+function teamSwitcher() {
+  const pills = crews.map((c) => `
+    <button data-action="select-crew" data-crew="${esc(c.id)}"
+      class="px-3 py-1.5 rounded-full text-sm font-medium transition ${c.id === activeCrewId ? "bg-accent text-ink" : "bg-slate-800 text-slate-300 hover:bg-slate-700"}">
+      ${esc(c.name)}</button>`).join("");
+  return `
+    <div class="flex flex-wrap items-center gap-2">
+      <span class="text-xs uppercase tracking-wide text-slate-500 mr-1">Teams</span>
+      ${pills || '<span class="text-sm text-slate-500">No teams yet</span>'}
+      <button data-action="new-crew"
+        class="px-3 py-1.5 rounded-full text-sm bg-slate-800 text-accent hover:bg-slate-700 transition">+ New Team</button>
+    </div>`;
+}
+
+// Pending email invites to other teams.
+function invitesBanner() {
+  if (!invites.length) return "";
+  return invites.map((c) => `
+    <div class="flex items-center justify-between gap-3 bg-amber-500/10 border border-amber-500/40 rounded-lg px-3 py-2">
+      <span class="text-sm">You're invited to <span class="font-bold">${esc(c.name)}</span></span>
+      <button data-action="accept-invite" data-crew="${esc(c.id)}"
+        class="px-3 py-1 rounded bg-emerald-600 hover:bg-emerald-500 transition text-sm font-semibold">Accept</button>
+    </div>`).join("");
+}
+
+// Members + invite management for the active team.
+function teamManagePanel() {
+  const crew = activeCrew();
+  if (!crew) return "";
+  const isOwner = user && crew.ownerUid === user.uid;
+  const members = crew.memberUids.map((m) => {
+    const isMe = user && m === user.uid;
+    const ownerTag = m === crew.ownerUid ? ' <span class="text-slate-500">· owner</span>' : "";
+    const removeBtn = (isOwner && m !== crew.ownerUid)
+      ? `<button data-action="remove-member" data-crew="${esc(crew.id)}" data-uid="${esc(m)}" class="text-xs text-slate-500 hover:text-red-400 transition">Remove</button>`
+      : "";
+    return `<div class="flex items-center justify-between text-sm py-0.5">
+      <span class="truncate">${isMe ? "You" : shortUid(m)}${ownerTag}</span>${removeBtn}</div>`;
+  }).join("");
+  const invited = crew.invitedEmails.map((e) => `
+    <div class="flex items-center justify-between text-sm py-0.5">
+      <span class="truncate text-slate-400">${esc(e)} <span class="text-[10px] text-amber-400">pending</span></span>
+      ${isOwner ? `<button data-action="revoke-invite" data-crew="${esc(crew.id)}" data-email="${esc(e)}" class="text-xs text-slate-500 hover:text-red-400 transition">Revoke</button>` : ""}
+    </div>`).join("");
+  const inviteForm = isOwner ? `
+    <div class="flex gap-2 pt-2 border-t border-slate-800">
+      <input data-invite-input data-crew="${esc(crew.id)}" type="email" placeholder="friend@email.com"
+        class="flex-1 bg-slate-800 rounded px-2 py-1 text-sm" />
+      <button data-action="invite-email" data-crew="${esc(crew.id)}"
+        class="px-3 py-1 rounded bg-accent text-ink text-sm font-semibold">Invite</button>
+    </div>` : "";
+  const leaveBtn = !isOwner
+    ? `<button data-action="leave-crew" data-crew="${esc(crew.id)}" class="text-xs text-slate-500 hover:text-red-400 transition">Leave team</button>`
+    : "";
+  return `
+    <div class="space-y-2">
+      <div class="flex items-center justify-between gap-2">
+        <div class="text-xs uppercase tracking-wide text-slate-500">${esc(crew.name)} · members</div>
+        ${leaveBtn}
+      </div>
+      <div>${members}</div>
+      ${invited ? `<div class="pt-1">${invited}</div>` : ""}
+      ${inviteForm}
+    </div>`;
+}
+
+function renderHome() {
+  const crew = activeCrew();
+  const list = championships.length
+    ? championships.map(championshipRow).join("")
+    : `<p class="text-slate-500 text-sm">${crew ? "No championships in this team yet — create your first one." : "Create or select a team to start."}</p>`;
+
+  const createBtn = crew
+    ? `<button data-action="new"
+         class="px-6 py-3 rounded-lg bg-accent text-ink hover:brightness-110 transition font-bold shadow-lg">+ Create</button>`
+    : `<button disabled title="Create or select a team first"
+         class="px-6 py-3 rounded-lg bg-slate-700 text-slate-400 font-bold cursor-not-allowed">+ Create</button>`;
+
+  shell(`
+    ${bgLayer()}
+    <div class="max-w-5xl mx-auto space-y-6">
+      <div class="bg-ink/90 border border-slate-800 rounded-xl p-4 shadow-xl space-y-3">
+        ${teamSwitcher()}
+        ${invitesBanner()}
+      </div>
+      <div class="text-center">${createBtn}</div>
       <div class="grid grid-cols-1 lg:grid-cols-2 gap-6 items-start">
-        <div class="bg-ink border border-slate-800 rounded-xl p-4 shadow-xl space-y-3">
-          <div class="text-xs uppercase tracking-wide text-slate-500">Saved championships</div>
-          ${list}
+        <div class="space-y-6">
+          <div class="bg-ink border border-slate-800 rounded-xl p-4 shadow-xl space-y-3">
+            <div class="text-xs uppercase tracking-wide text-slate-500">${crew ? esc(crew.name) + " · championships" : "Championships"}</div>
+            ${list}
+          </div>
+          ${crew ? `<div class="bg-ink border border-slate-800 rounded-xl p-4 shadow-xl">${teamManagePanel()}</div>` : ""}
         </div>
         <div class="bg-ink border border-slate-800 rounded-xl p-4 shadow-xl">
           ${mapPoolSection()}
@@ -710,11 +893,104 @@ async function onClick(e) {
       clearMapOrder();
       return render();
 
+    case "sign-in":
+      try { await signInWithGoogle(); }       // onAuth handler re-renders on success
+      catch (e) { console.error("sign-in failed", e); }
+      return;
+
+    case "sign-out":
+      try { await signOutUser(); }            // onAuth handler renders sign-in screen
+      catch (e) { console.error("sign-out failed", e); }
+      return;
+
+    case "new-crew":
+      view = { name: "new-crew" };
+      return render();
+
+    case "crew-submit": {
+      const input = document.querySelector("[data-crew-input]");
+      const name = (input && input.value.trim()) || "My Team";
+      try {
+        const crew = await withLoading("Creating team…", () => createCrew(name));
+        activeCrewId = crew.id;
+        try { localStorage.setItem(ACTIVE_CREW_KEY, crew.id); } catch { /* ignore */ }
+        await withLoading("Loading team…", async () => { await refreshCrews(); await refreshChampionships(); });
+      } catch (e) { console.error("create team failed", e); }
+      view = { name: "home" };
+      return render();
+    }
+
+    case "select-crew": {
+      activeCrewId = el.dataset.crew;
+      try { localStorage.setItem(ACTIVE_CREW_KEY, activeCrewId); } catch { /* ignore */ }
+      await refreshChampionships();
+      // Owner: opportunistically propagate membership to existing championships.
+      const c = activeCrew();
+      if (c && user && c.ownerUid === user.uid) syncCrewMembership(c.id).catch(() => {});
+      return render();
+    }
+
+    case "accept-invite":
+      await withLoading("Joining team…", async () => {
+        try { await acceptInvite(el.dataset.crew); } catch (e) { console.error("accept failed", e); }
+        activeCrewId = el.dataset.crew;
+        try { localStorage.setItem(ACTIVE_CREW_KEY, activeCrewId); } catch { /* ignore */ }
+        await refreshCrews();
+        await refreshChampionships();
+      });
+      return render();
+
+    case "invite-email": {
+      const input = document.querySelector(`[data-invite-input][data-crew="${el.dataset.crew}"]`)
+        || document.querySelector("[data-invite-input]");
+      const email = (input && input.value.trim()) || "";
+      if (!email) { flash(input); return; }
+      try {
+        await withLoading("Sending invite…", () => inviteEmail(el.dataset.crew, email));
+        await refreshCrews();
+      } catch (e) { console.error("invite failed", e); }
+      return render();
+    }
+
+    case "revoke-invite":
+      try {
+        await withLoading("Removing invite…", () => revokeInvite(el.dataset.crew, el.dataset.email));
+        await refreshCrews();
+      } catch (e) { console.error("revoke failed", e); }
+      return render();
+
+    case "remove-member":
+      try {
+        await withLoading("Removing member…", () => removeMember(el.dataset.crew, el.dataset.uid));
+        await refreshCrews();
+      } catch (e) { console.error("remove member failed", e); }
+      return render();
+
+    case "leave-crew": {
+      const ok = await confirmDialog({
+        title: "Leave team?",
+        message: "You'll lose access to this team's championships.",
+        confirmLabel: "Leave",
+        danger: true,
+      });
+      if (!ok) return;
+      await withLoading("Leaving team…", async () => {
+        try { await leaveCrew(el.dataset.crew); } catch (e) { console.error("leave failed", e); }
+        if (activeCrewId === el.dataset.crew) activeCrewId = null;
+        await refreshCrews();
+        await refreshChampionships();
+      });
+      return render();
+    }
+
     case "select-team": {
+      const crew = activeCrew();
+      if (!crew || !user) return;   // can only create within a team
       const state = generateTournament(el.dataset.team);
       const name = (view.pendingName || "").trim() || `Championship ${championships.length + 1}`;
       try {
-        const rec = await withLoading("Creating championship…", () => createChampionship(name, state));
+        const rec = await withLoading("Creating championship…",
+          () => createChampionship(name, state, crew.id, crew.memberUids, user.uid));
         championshipId = rec.id;
         championshipName = rec.name;
       } catch (e) {
@@ -837,28 +1113,54 @@ function flash(input) {
 
 // ---- Bootstrap ------------------------------------------------------------
 
+// Enter-key submits the focused text input by triggering its paired button.
+const ENTER_SUBMITS = [
+  { sel: "[data-name-input]", action: '[data-action="name-submit"]' },
+  { sel: "[data-crew-input]", action: '[data-action="crew-submit"]' },
+  { sel: "[data-invite-input]", action: '[data-action="invite-email"]' },
+];
+
 async function main() {
-  try {
-    await withLoading("Loading championships…", async () => {
-      await initDB();
-      // One-time copy of any championships saved by the old IndexedDB build.
-      await migrateIndexedDBToFirestore();
-      await refreshChampionships();
-    });
-  } catch (err) {
-    console.error("DB init failed, continuing in-memory:", err);
-  }
-  view = { name: "home" };
+  await initDB();
   app().addEventListener("click", onClick);
-  // Submit the championship name with Enter.
   app().addEventListener("keydown", (e) => {
-    if (e.key === "Enter" && e.target.matches("[data-name-input]")) {
-      e.preventDefault();
-      const btn = document.querySelector('[data-action="name-submit"]');
-      if (btn) onClick({ target: btn });
+    if (e.key !== "Enter") return;
+    for (const { sel, action } of ENTER_SUBMITS) {
+      if (e.target.matches(sel)) {
+        e.preventDefault();
+        // Prefer a button scoped to the same crew (invite forms), else any.
+        const crew = e.target.dataset.crew;
+        const btn = (crew && document.querySelector(`${action.slice(0, -1)}][data-crew="${crew}"]`))
+          || document.querySelector(action);
+        if (btn) onClick({ target: btn });
+        return;
+      }
     }
   });
-  render();
+
+  // Gate the whole app on auth state. Fires immediately with the current user
+  // (or null) and again on every sign-in/sign-out.
+  onAuth(async (u) => {
+    user = u || null;
+    if (!user) {
+      crews = []; invites = []; championships = []; allChampionships = [];
+      tournament = null; championshipId = null; championshipName = "";
+      return render();
+    }
+    try {
+      await withLoading("Loading your teams…", async () => {
+        await refreshCrews();
+        await refreshChampionships();
+      });
+    } catch (err) {
+      console.error("startup load failed:", err);
+    }
+    // Owner: propagate membership to the active team's existing championships.
+    const c = activeCrew();
+    if (c && c.ownerUid === user.uid) syncCrewMembership(c.id).catch(() => {});
+    view = { name: "home" };
+    render();
+  });
 }
 
 main();

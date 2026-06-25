@@ -1,14 +1,97 @@
 rules_version = '2';
 
 // Rules for the named "chemist-site" Firestore database.
+//
+// Auth is required for everything. Championships are scoped to a "crew" (a
+// collaborative Team of users): every crew member can read and edit the crew's
+// championships. Membership is enforced two ways that must stay in sync:
+//   - crews/{id}.memberUids is the source of truth.
+//   - championships/{id}.memberUids is a denormalized copy used for read auth
+//     and list queries (array-contains), kept current by crews.syncCrewMembership.
 service cloud.firestore {
   match /databases/{database}/documents {
 
-    // The client has no authentication wired in yet, so the championships
-    // collection is openly readable/writable. Lock this down (e.g. require
-    // request.auth != null) before treating the data as anything but public.
+    function signedIn() { return request.auth != null; }
+    function myUid()    { return request.auth.uid; }
+    // Lowercased to match the emails we store; Google tokens may carry mixed case.
+    function myEmail()  { return request.auth.token.email.lower(); }
+
+    // ---- Crews (collaborative Teams of users) ----
+    match /crews/{crewId} {
+      function existing() { return resource.data; }
+      function incoming() { return request.resource.data; }
+      function isMember()  { return signedIn() && myUid() in existing().memberUids; }
+      function isOwner()   { return signedIn() && myUid() == existing().ownerUid; }
+      function isInvited() { return signedIn() && myEmail() in existing().invitedEmails; }
+
+      // Members read their crew; an invited (not-yet-member) user must also read
+      // it so the invite-accept flow can find and update it.
+      allow read: if isMember() || isInvited();
+
+      // Create only your own crew, with yourself as owner and sole member.
+      allow create: if signedIn()
+        && incoming().ownerUid == myUid()
+        && incoming().memberUids == [myUid()];
+
+      // An invited user may add ONLY their own uid to members and remove ONLY
+      // their own email from invitedEmails (the accept-invite path).
+      function isSelfJoin() {
+        return isInvited()
+          && !(myUid() in existing().memberUids)
+          && incoming().memberUids == existing().memberUids.concat([myUid()])
+          && incoming().invitedEmails == existing().invitedEmails.removeAll([myEmail()])
+          && incoming().ownerUid == existing().ownerUid
+          && incoming().name == existing().name;
+      }
+
+      // A non-owner member may remove ONLY their own uid (the leave path).
+      function isSelfLeave() {
+        return isMember()
+          && myUid() != existing().ownerUid
+          && incoming().memberUids == existing().memberUids.removeAll([myUid()])
+          && incoming().invitedEmails == existing().invitedEmails
+          && incoming().ownerUid == existing().ownerUid
+          && incoming().name == existing().name;
+      }
+
+      // Owner may manage anything (rename, invite, remove members).
+      allow update: if isOwner() || isSelfJoin() || isSelfLeave();
+      allow delete: if isOwner();
+    }
+
+    // ---- Championships (crew-scoped) ----
     match /championships/{championshipId} {
-      allow read, write: if true;
+      function existing() { return resource.data; }
+      function incoming() { return request.resource.data; }
+      function crewMembers(crewId) {
+        return get(/databases/$(database)/documents/crews/$(crewId)).data.memberUids;
+      }
+
+      // Read: authorize on the doc's own denormalized members — no extra reads,
+      // and works for the array-contains list query.
+      allow read: if signedIn() && myUid() in existing().memberUids;
+
+      // Create: creator must belong to the referenced crew, and the new doc's
+      // memberUids must equal that crew's authoritative members.
+      allow create: if signedIn()
+        && incoming().createdBy == myUid()
+        && myUid() in crewMembers(incoming().crewId)
+        && incoming().memberUids == crewMembers(incoming().crewId);
+
+      // Update: any member may edit gameplay state; crewId is immutable. The
+      // `||` short-circuits so normal saves (memberUids unchanged) cost no extra
+      // read; only the membership-backfill write resets memberUids to the crew's
+      // current list (validated via one get()).
+      allow update: if signedIn()
+        && myUid() in existing().memberUids
+        && incoming().crewId == existing().crewId
+        && (
+          incoming().memberUids == existing().memberUids
+          || incoming().memberUids == crewMembers(existing().crewId)
+        );
+
+      // Delete: any member (matches the existing "delete championship" UX).
+      allow delete: if signedIn() && myUid() in existing().memberUids;
     }
 
     // Everything else is denied by default.
