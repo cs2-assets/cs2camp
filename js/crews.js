@@ -95,6 +95,13 @@ export async function getCrew(crewId) {
   return snap.exists() ? fromCrew(snap) : null;
 }
 
+// Owner-only (per rules): rename the team.
+export async function renameCrew(crewId, name) {
+  const trimmed = (name || "").trim();
+  if (!trimmed) return;
+  await updateDoc(doc(db, CREWS, crewId), { name: trimmed, updatedAt: Date.now() });
+}
+
 // Owner-only (per rules): invite a friend by email. No account needed yet.
 export async function inviteEmail(crewId, rawEmail) {
   const e = (rawEmail || "").trim().toLowerCase();
@@ -141,9 +148,23 @@ export async function leaveCrew(crewId) {
   return removeMember(crewId, requireUid());
 }
 
-// Owner-only: delete the crew document. (Championships are left intact; callers
-// should handle them separately if desired.)
-export async function deleteCrew(crewId) {
+// Owner-only: delete the crew and all of its championships. The championships
+// are removed first (any member may delete them per the rules) so they don't
+// linger as orphans once the crew is gone. Best-effort batched delete.
+//
+// We query by `memberUids array-contains <uid>` (the only championship query the
+// security rules permit — "rules are not filters") and filter to this crew in
+// memory; querying by crewId alone would be rejected as permission-denied.
+export async function deleteCrewWithChampionships(crewId) {
+  const u = requireUid();
+  const snap = await getDocs(query(collection(db, CHAMPS), where("memberUids", "array-contains", u)));
+  const docs = snap.docs.filter((d) => (d.data().crewId === crewId));
+  // Firestore batches cap at 500 writes; chunk to stay well under.
+  for (let i = 0; i < docs.length; i += 400) {
+    const batch = writeBatch(db);
+    for (const d of docs.slice(i, i + 400)) batch.delete(d.ref);
+    await batch.commit();
+  }
   await deleteDoc(doc(db, CREWS, crewId));
 }
 
@@ -152,11 +173,16 @@ export async function deleteCrew(crewId) {
 // created after they joined). Run by a member who can already read those docs
 // (in practice the owner). Best-effort; safe to call repeatedly.
 export async function syncCrewMembership(crewId) {
+  const u = uid();
+  if (!u) return;
   const crew = await getCrew(crewId);
   if (!crew) return;
-  const snap = await getDocs(query(collection(db, CHAMPS), where("crewId", "==", crewId)));
+  // Same constraint as above: query by our own membership, filter to the crew.
+  const snap = await getDocs(query(collection(db, CHAMPS), where("memberUids", "array-contains", u)));
   const stale = snap.docs.filter((d) => {
-    const cur = d.data().memberUids || [];
+    const data = d.data();
+    if (data.crewId !== crewId) return false;
+    const cur = data.memberUids || [];
     return cur.length !== crew.memberUids.length
       || crew.memberUids.some((m) => !cur.includes(m));
   });

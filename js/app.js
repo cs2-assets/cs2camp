@@ -25,10 +25,11 @@ import {
   STAGE_LABELS,
 } from "./engine.js";
 import { createVeto, currentAction, applyVeto, autoVetoOpponent, userOptions, chooseSide, needsUserSide, PICK_COUNT, BAN_COUNT } from "./veto.js";
-import { confirmDialog } from "./dialog.js";
+import { confirmDialog, alertDialog } from "./dialog.js";
 import { withLoading, setSaving } from "./loading.js";
 import { getMapOrder, setMapOrder, clearMapOrder } from "./prefs.js";
 import { onAuth, signInWithGoogle, signOutUser } from "./auth.js";
+import { grantChampionReward } from "./rewards.js";
 import {
   createCrew,
   listMyCrews,
@@ -38,6 +39,8 @@ import {
   acceptInvite,
   removeMember,
   leaveCrew,
+  renameCrew,
+  deleteCrewWithChampionships,
   syncCrewMembership,
 } from "./crews.js";
 import Sortable from "sortablejs";
@@ -48,6 +51,7 @@ let user = null;             // signed-in Firebase user (null when logged out)
 let crews = [];              // Teams the user belongs to
 let invites = [];            // pending Team invites (by email)
 let activeCrewId = null;     // currently selected Team
+let editingTeamName = false; // inline rename of the active Team in progress
 let tournament = null;       // active in-memory Tournament snapshot
 let championshipId = null;   // id of the active saved championship record
 let championshipName = "";    // its display name
@@ -58,6 +62,24 @@ const app = () => document.getElementById("app");
 const ACTIVE_CREW_KEY = "cs2.activeCrewId";
 function activeCrew() {
   return crews.find((c) => c.id === activeCrewId) || null;
+}
+
+// When the active championship is won by the user's own CS team, grant the
+// signed-in user a reward in Habit Farm (see rewards.js). Best-effort and
+// once-per-session per championship (the write itself is idempotent anyway).
+const grantedRewards = new Set();
+async function maybeGrantChampionReward() {
+  if (!tournament || !championshipId) return;
+  const champ = tournament.champion;
+  if (!champ || champ.id !== tournament.selectedTeamId) return;
+  if (grantedRewards.has(championshipId)) return;
+  grantedRewards.add(championshipId);
+  try {
+    await grantChampionReward(championshipId, champ.name);
+  } catch (e) {
+    console.error("Habit Farm reward grant failed", e);
+    grantedRewards.delete(championshipId);   // allow a retry next time
+  }
 }
 
 async function save({ silent = false } = {}) {
@@ -390,14 +412,25 @@ function teamManagePanel() {
       <button data-action="invite-email" data-crew="${esc(crew.id)}"
         class="px-3 py-1 rounded bg-accent text-ink text-sm font-semibold">Invite</button>
     </div>` : "";
-  const leaveBtn = !isOwner
-    ? `<button data-action="leave-crew" data-crew="${esc(crew.id)}" class="text-xs text-slate-500 hover:text-red-400 transition">Leave team</button>`
-    : "";
+  const manageBtn = isOwner
+    ? `<button data-action="delete-crew" data-crew="${esc(crew.id)}" class="text-xs text-red-400 transition">Delete team</button>`
+    : `<button data-action="leave-crew" data-crew="${esc(crew.id)}" class="text-xs text-red-400 transition">Leave team</button>`;
+  const nameBlock = (isOwner && editingTeamName)
+    ? `<div class="flex items-center gap-2 min-w-0">
+        <input data-team-name-input data-crew="${esc(crew.id)}" type="text" maxlength="40" value="${esc(crew.name)}"
+          class="bg-slate-800 rounded px-2 py-1 text-sm min-w-0" />
+        <button data-action="save-crew-name" data-crew="${esc(crew.id)}" class="text-xs text-accent hover:brightness-110 shrink-0">Save</button>
+        <button data-action="cancel-rename" class="text-xs text-slate-300 shrink-0">Cancel</button>
+      </div>`
+    : `<div class="flex items-center gap-2 min-w-0">
+        <div class="text-xs uppercase tracking-wide text-slate-500 truncate">${esc(crew.name)} · members</div>
+        ${isOwner ? `<button data-action="rename-crew" class="text-xs text-accent shrink-0">Rename</button>` : ""}
+      </div>`;
   return `
     <div class="space-y-2">
       <div class="flex items-center justify-between gap-2">
-        <div class="text-xs uppercase tracking-wide text-slate-500">${esc(crew.name)} · members</div>
-        ${leaveBtn}
+        ${nameBlock}
+        ${manageBtn}
       </div>
       <div>${members}</div>
       ${invited ? `<div class="pt-1">${invited}</div>` : ""}
@@ -604,7 +637,8 @@ function renderBracket() {
           ${avatar(champ, "h-12 w-12 text-base")}
           <span class="text-2xl font-black">${esc(champ.name)}</span>
         </div>
-        ${isUserTeam(champ) ? '<div class="mt-1 text-emerald-300 font-semibold">🏆 Your team won it all!</div>' : ""}
+        ${isUserTeam(champ) ? `<div class="mt-1 text-emerald-300 font-semibold">🏆 Your team won it all!</div>
+          <div class="mt-1 text-xs text-slate-300">🎁 A reward is waiting in your Habit Farm store (reload Habit Farm to see it).</div>` : ""}
       </div>`
     : "";
 
@@ -922,6 +956,7 @@ async function onClick(e) {
 
     case "select-crew": {
       activeCrewId = el.dataset.crew;
+      editingTeamName = false;
       try { localStorage.setItem(ACTIVE_CREW_KEY, activeCrewId); } catch { /* ignore */ }
       await refreshChampionships();
       // Owner: opportunistically propagate membership to existing championships.
@@ -983,6 +1018,65 @@ async function onClick(e) {
       return render();
     }
 
+    case "delete-crew": {
+      const c = crews.find((x) => x.id === el.dataset.crew);
+      const ok = await confirmDialog({
+        title: `Delete ${c ? c.name : "team"}?`,
+        message: "This permanently deletes the team and all of its championships for everyone. This cannot be undone.",
+        confirmLabel: "Delete team",
+        danger: true,
+      });
+      if (!ok) return;
+      let delErr = null;
+      await withLoading("Deleting team…", async () => {
+        try {
+          await deleteCrewWithChampionships(el.dataset.crew);
+        } catch (e) { delErr = e; return; }
+        if (activeCrewId === el.dataset.crew) {
+          activeCrewId = null;
+          try { localStorage.removeItem(ACTIVE_CREW_KEY); } catch { /* ignore */ }
+        }
+        await refreshCrews();
+        await refreshChampionships();
+      });
+      if (delErr) {
+        console.error("delete team failed", delErr);
+        await alertDialog({ title: "Couldn't delete team", message: friendlyErr(delErr), danger: true });
+        return render();
+      }
+      // If the deleted team was open as a championship, drop back to home.
+      tournament = null; championshipId = null; championshipName = "";
+      view = { name: "home" };
+      return render();
+    }
+
+    case "rename-crew":
+      editingTeamName = true;
+      return render();
+
+    case "cancel-rename":
+      editingTeamName = false;
+      return render();
+
+    case "save-crew-name": {
+      const input = document.querySelector(`[data-team-name-input][data-crew="${el.dataset.crew}"]`)
+        || document.querySelector("[data-team-name-input]");
+      const name = (input && input.value.trim()) || "";
+      const c = crews.find((x) => x.id === el.dataset.crew);
+      if (name && c && name !== c.name) {
+        try {
+          await withLoading("Renaming team…", () => renameCrew(el.dataset.crew, name));
+          await refreshCrews();
+        } catch (e) {
+          console.error("rename failed", e);
+          await alertDialog({ title: "Couldn't rename team", message: friendlyErr(e), danger: true });
+          return render();
+        }
+      }
+      editingTeamName = false;
+      return render();
+    }
+
     case "select-team": {
       const crew = activeCrew();
       if (!crew || !user) return;   // can only create within a team
@@ -1011,6 +1105,7 @@ async function onClick(e) {
         championshipName = rec.name;
         tournament = rec.state;
         view = { name: "bracket" };
+        maybeGrantChampionReward();   // already-won championship → grant on open
       } catch (e) { console.error("resume failed", e); }
       return render();
     }
@@ -1073,7 +1168,7 @@ async function onClick(e) {
       const scoreA = Math.max(0, parseInt(inA.value, 10) || 0);
       const scoreB = Math.max(0, parseInt(inB.value, 10) || 0);
       if (scoreA === scoreB) { flash(inA); flash(inB); return; }
-      return update((t) => {
+      await update((t) => {
         const m = findMatch(t, matchId);
         const done = recordMap(m, el.dataset.map, scoreA, scoreB);
         if (done) {
@@ -1083,6 +1178,8 @@ async function onClick(e) {
           resolveAiMatches(t);
         }
       }, "Saving score…");
+      maybeGrantChampionReward();   // best-effort if this completed the title
+      return;
     }
 
     case "reset": {
@@ -1110,6 +1207,16 @@ function flash(input) {
   setTimeout(() => input.classList.remove("ring-2", "ring-red-500"), 600);
 }
 
+// Human-readable message for a Firestore error, with a hint for the common
+// "rules not deployed" case.
+function friendlyErr(e) {
+  const msg = (e && (e.message || e.code)) ? `${e.code || ""} ${e.message || ""}`.trim() : String(e);
+  if (/permission|insufficient|PERMISSION_DENIED/i.test(msg)) {
+    return "The database rejected this (permission denied). The Firestore security rules may not be deployed — run `npm run deploy:rules`.";
+  }
+  return msg || "Unknown error.";
+}
+
 
 // ---- Bootstrap ------------------------------------------------------------
 
@@ -1118,6 +1225,7 @@ const ENTER_SUBMITS = [
   { sel: "[data-name-input]", action: '[data-action="name-submit"]' },
   { sel: "[data-crew-input]", action: '[data-action="crew-submit"]' },
   { sel: "[data-invite-input]", action: '[data-action="invite-email"]' },
+  { sel: "[data-team-name-input]", action: '[data-action="save-crew-name"]' },
 ];
 
 async function main() {

@@ -22,6 +22,12 @@ const firebaseConfig = {
 // Named Firestore database the app reads/writes.
 export const FIRESTORE_DATABASE_ID = "chemist-site";
 
+// Habit Farm lives in the same Firebase project but a different named database.
+// We write champion rewards into its "rewards" collection (see rewards.js).
+// Auth is shared across the project, so our user uids are valid there too.
+export const HABIT_FARM_DATABASE_ID = "tcp-rpg";
+
 export const app = initializeApp(firebaseConfig);
 export const db = getFirestore(app, FIRESTORE_DATABASE_ID);
+export const habitDb = getFirestore(app, HABIT_FARM_DATABASE_ID);
 export const auth = getAuth(app);

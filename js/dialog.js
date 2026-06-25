@@ -80,3 +80,14 @@ export function confirmDialog(opts = {}) {
     if (confirmBtn) confirmBtn.focus();
   });
 }
+
+// Simple acknowledge-only dialog. Resolves when dismissed.
+export function alertDialog(opts = {}) {
+  return confirmDialog({
+    title: opts.title || "Notice",
+    message: opts.message || "",
+    confirmLabel: opts.confirmLabel || "OK",
+    cancelLabel: opts.cancelLabel || "Close",
+    danger: !!opts.danger,
+  });
+}
