@@ -1426,15 +1426,27 @@ function fmtDuration(secs) {
   return `${m}:${String(s % 60).padStart(2, "0")}`;
 }
 
+// Firestore Timestamp | millis | {seconds} | ISO/Date -> millis (0 if unknown).
+function csMillis(v) {
+  if (!v) return 0;
+  if (typeof v === "number") return v;
+  if (typeof v.toMillis === "function") return v.toMillis();
+  if (v.seconds != null) return v.seconds * 1000;
+  const t = new Date(v).getTime();
+  return isNaN(t) ? 0 : t;
+}
+
 function fmtCsDate(v) {
-  if (!v) return "";
-  let ms = 0;
-  if (typeof v === "number") ms = v;
-  else if (typeof v.toMillis === "function") ms = v.toMillis();
-  else if (v.seconds != null) ms = v.seconds * 1000;
-  else ms = new Date(v).getTime();
-  if (!ms || isNaN(ms)) return "";
+  const ms = csMillis(v);
+  if (!ms) return "";
   try { return new Date(ms).toLocaleString(); } catch { return ""; }
+}
+
+// Short "Jun 26" style date for compact analytics rows.
+function fmtCsDateShort(v) {
+  const ms = csMillis(v);
+  if (!ms) return "";
+  try { return new Date(ms).toLocaleDateString(undefined, { month: "short", day: "numeric" }); } catch { return ""; }
 }
 
 // One round-by-round strip colored by the winning side (CT blue / T amber).
@@ -1991,6 +2003,276 @@ function personalRecordsWall(rawDocs) {
     </div>`;
 }
 
+// Normalize one per-player-match doc into a "game" used by the historic
+// analytics: the flat stat row plus a date, a derived map win/loss result, and
+// CT/T round splits. Win/loss prefers the doc's teamScore/enemyScore, falling
+// back to counting rounds[].won. Per-round side is derived from won + winnerSide
+// (no halftime math needed): a won round was played on the winning side.
+function normalizeGame(d) {
+  const row = csPlayerRow(d);
+  const rounds = Array.isArray(d.rounds) ? d.rounds : [];
+  let teamScore = null, enemyScore = null, result = null;
+  if (d.teamScore != null && d.enemyScore != null) {
+    teamScore = csNum(d.teamScore); enemyScore = csNum(d.enemyScore);
+  } else if (rounds.length) {
+    teamScore = rounds.filter((r) => r.won).length;
+    enemyScore = rounds.length - teamScore;
+  }
+  if (teamScore != null) result = teamScore > enemyScore ? "W" : teamScore < enemyScore ? "L" : "T";
+
+  let ctPlayed = 0, ctWon = 0, tPlayed = 0, tWon = 0;
+  for (const r of rounds) {
+    const ws = String(r.winnerSide || "").toUpperCase();
+    if (ws !== "CT" && ws !== "T") continue;
+    const won = !!r.won;
+    const side = won ? ws : ws === "CT" ? "T" : "CT";
+    if (side === "CT") { ctPlayed++; if (won) ctWon++; }
+    else { tPlayed++; if (won) tWon++; }
+  }
+  return {
+    ...row,
+    date: csMillis(d.endedAtUtc), rawDate: d.endedAtUtc, result, teamScore, enemyScore,
+    kd: row.deaths ? row.kills / row.deaths : row.kills,
+    ctPlayed, ctWon, tPlayed, tWon,
+  };
+}
+
+// SVG line chart of rating across the player's games (oldest → newest), with a
+// 1.00 average reference line and a win/loss-colored dot per game.
+function playerTrendChart(games) {
+  if (games.length < 2) return "";
+  const W = 100, H = 36;
+  const ratings = games.map((g) => g.rating);
+  const maxR = Math.max(1.3, ...ratings), minR = Math.min(0.7, ...ratings);
+  const span = maxR - minR || 1;
+  const px = (i) => (i / (games.length - 1)) * W;
+  const py = (r) => H - ((r - minR) / span) * H;
+  const path = games.map((g, i) => `${px(i).toFixed(2)},${py(g.rating).toFixed(2)}`).join(" ");
+  const baseY = py(1).toFixed(2);
+  const dots = games.map((g, i) => {
+    const c = g.result === "W" ? "rgb(52 211 153)" : g.result === "L" ? "rgb(248 113 113)" : "rgb(148 163 184)";
+    return `<circle cx="${px(i).toFixed(2)}" cy="${py(g.rating).toFixed(2)}" r="0.9" fill="${c}" />`;
+  }).join("");
+  return `
+    <div class="space-y-1">
+      <div class="text-[11px] text-slate-400">Rating over time
+        <span class="text-slate-600">(oldest → newest · dashed = 1.00 average · green win / red loss)</span></div>
+      <svg viewBox="0 0 ${W} ${H}" preserveAspectRatio="none" class="w-full h-28 rounded bg-slate-950/40">
+        <line x1="0" y1="${baseY}" x2="${W}" y2="${baseY}" stroke="rgb(100 116 139 / 0.5)" stroke-width="0.4" stroke-dasharray="1.5 1.5" />
+        <polyline points="${path}" fill="none" stroke="rgb(245 158 11)" stroke-width="1.1" vector-effect="non-scaling-stroke" stroke-linejoin="round" stroke-linecap="round" />
+        ${dots}
+      </svg>
+    </div>`;
+}
+
+// Per-map record table: maps played, W-L, win%, avg rating, K/D, ADR.
+function mapPerformanceTable(games) {
+  const byMap = new Map();
+  for (const g of games) {
+    const m = g.map || "Unknown";
+    let s = byMap.get(m);
+    if (!s) { s = { map: m, n: 0, w: 0, l: 0, kills: 0, deaths: 0, rounds: 0, adrSum: 0, ratingSum: 0 }; byMap.set(m, s); }
+    s.n++; if (g.result === "W") s.w++; else if (g.result === "L") s.l++;
+    s.kills += g.kills; s.deaths += g.deaths; s.rounds += g.rounds;
+    s.adrSum += g.adr * g.rounds; s.ratingSum += g.rating;
+  }
+  const rows = [...byMap.values()].map((s) => ({
+    ...s,
+    winPct: s.n ? (s.w / s.n) * 100 : 0,
+    kd: s.deaths ? s.kills / s.deaths : s.kills,
+    adr: s.rounds ? s.adrSum / s.rounds : 0,
+    rating: s.n ? s.ratingSum / s.n : 0,
+  })).sort((a, b) => b.n - a.n);
+  if (!rows.length) return "";
+  const body = rows.map((r) => `
+    <tr class="border-t border-slate-800">
+      <td class="py-1.5 pr-2"><span class="flex items-center gap-1.5">${mapIconImg(r.map, "h-4 w-4")}${esc(r.map)}</span></td>
+      <td class="px-2 text-center font-mono">${r.n}</td>
+      <td class="px-2 text-center font-mono text-slate-400">${r.w}-${r.l}</td>
+      <td class="px-2 text-center font-mono ${r.winPct >= 50 ? "text-emerald-400" : "text-slate-300"}">${r.winPct.toFixed(0)}%</td>
+      <td class="px-2 text-center font-mono">${ratingCell(r.rating)}</td>
+      <td class="px-2 text-center font-mono ${r.kd >= 1 ? "text-emerald-400" : "text-slate-300"}">${r.kd.toFixed(2)}</td>
+      <td class="px-2 text-center font-mono">${r.adr.toFixed(0)}</td>
+    </tr>`).join("");
+  return `
+    <div class="overflow-x-auto"><table class="w-full text-xs">
+      <thead class="text-slate-500 uppercase tracking-wide text-[10px]"><tr>
+        <th class="py-1 pr-2 text-left">Map</th><th class="px-2">M</th><th class="px-2">W-L</th>
+        <th class="px-2">Win%</th><th class="px-2">RAT</th><th class="px-2">K/D</th><th class="px-2">ADR</th>
+      </tr></thead><tbody>${body}</tbody></table></div>`;
+}
+
+// CT vs T round-win-rate bars aggregated across all games.
+function sideSplitPanel(games) {
+  let ctP = 0, ctW = 0, tP = 0, tW = 0;
+  for (const g of games) { ctP += g.ctPlayed; ctW += g.ctWon; tP += g.tPlayed; tW += g.tWon; }
+  if (!ctP && !tP) return "";
+  const ctPct = ctP ? (ctW / ctP) * 100 : 0, tPct = tP ? (tW / tP) * 100 : 0;
+  const bar = (label, pct, played, won, color) => `
+    <div class="space-y-1">
+      <div class="flex justify-between text-[11px]"><span class="text-slate-400">${label}</span>
+        <span class="font-mono text-slate-300">${won}/${played} · ${pct.toFixed(0)}%</span></div>
+      <div class="h-2 rounded bg-slate-800 overflow-hidden"><span class="block h-full ${color}" style="width:${pct.toFixed(0)}%"></span></div>
+    </div>`;
+  return `
+    <div class="space-y-2">
+      <div class="text-[11px] text-slate-400">Round win rate by side</div>
+      ${bar("CT side", ctPct, ctP, ctW, "bg-sky-500/80")}
+      ${bar("T side", tPct, tP, tW, "bg-amber-500/80")}
+    </div>`;
+}
+
+// Chronological match history (newest first), capped at `limit`.
+function matchHistoryList(games, limit = 20) {
+  const recent = [...games].reverse().slice(0, limit);
+  if (!recent.length) return "";
+  const rows = recent.map((g) => {
+    const res = g.result === "W" ? `<span class="text-emerald-400 font-bold">W</span>`
+      : g.result === "L" ? `<span class="text-red-400 font-bold">L</span>`
+      : `<span class="text-slate-500">–</span>`;
+    const score = g.teamScore != null ? `${g.teamScore}-${g.enemyScore}` : "";
+    return `
+      <tr class="border-t border-slate-800">
+        <td class="py-1.5 pr-2 text-slate-500 whitespace-nowrap">${esc(fmtCsDateShort(g.rawDate))}</td>
+        <td class="px-2"><span class="flex items-center gap-1.5 min-w-0">${mapIconImg(g.map, "h-4 w-4")}<span class="truncate">${esc(g.map || "—")}</span></span></td>
+        <td class="px-2 text-center">${res}</td>
+        <td class="px-2 text-center font-mono text-slate-400">${score}</td>
+        <td class="px-2 text-center font-mono">${ratingCell(g.rating)}</td>
+        <td class="px-2 text-center font-mono text-slate-300">${g.kills}-${g.deaths}-${g.assists}</td>
+        <td class="px-2 text-center font-mono text-slate-400">${g.adr.toFixed(0)}</td>
+      </tr>`;
+  }).join("");
+  const more = games.length > limit ? `<div class="text-[10px] text-slate-600 mt-1">Showing ${limit} of ${games.length} maps.</div>` : "";
+  return `
+    <div class="overflow-x-auto"><table class="w-full text-xs">
+      <thead class="text-slate-500 uppercase tracking-wide text-[10px]"><tr>
+        <th class="py-1 pr-2 text-left">Date</th><th class="px-2 text-left">Map</th><th class="px-2">Res</th>
+        <th class="px-2">Score</th><th class="px-2">RAT</th><th class="px-2">K-D-A</th><th class="px-2">ADR</th>
+      </tr></thead><tbody>${rows}</tbody></table></div>${more}`;
+}
+
+// Auto-generated "intelligence" bullets derived from the player's history and
+// aggregate (`me`): form trend, best/worst map, side preference, role/playstyle,
+// signature weapon, and consistency. Each gates on enough sample size.
+function playerInsights(games, me) {
+  const out = [];
+  if (!games.length || !me) return out;
+  const avgOf = (arr) => arr.reduce((s, g) => s + g.rating, 0) / arr.length;
+
+  if (games.length >= 6) {
+    const recentAvg = avgOf(games.slice(-5)), allAvg = avgOf(games), delta = recentAvg - allAvg;
+    if (Math.abs(delta) >= 0.05) out.push(delta > 0
+      ? { icon: "📈", text: `Trending up — last 5 maps average ${recentAvg.toFixed(2)} rating, ${delta.toFixed(2)} above your norm.` }
+      : { icon: "📉", text: `In a dip — last 5 maps average ${recentAvg.toFixed(2)} rating, ${Math.abs(delta).toFixed(2)} below your norm.` });
+  }
+
+  const mapStats = new Map();
+  for (const g of games) { const m = g.map || "Unknown"; const s = mapStats.get(m) || { n: 0, sum: 0, w: 0 }; s.n++; s.sum += g.rating; if (g.result === "W") s.w++; mapStats.set(m, s); }
+  const ranked = [...mapStats.entries()].filter(([, s]) => s.n >= 2)
+    .map(([m, s]) => ({ map: m, avg: s.sum / s.n, n: s.n, winPct: (s.w / s.n) * 100 }))
+    .sort((a, b) => b.avg - a.avg);
+  if (ranked.length) { const best = ranked[0]; out.push({ icon: "⭐", text: `Strongest map: ${best.map} — ${best.avg.toFixed(2)} rating over ${best.n} maps (${best.winPct.toFixed(0)}% wins).` }); }
+  if (ranked.length >= 3) { const worst = ranked[ranked.length - 1]; out.push({ icon: "⚠️", text: `Weakest map: ${worst.map} — ${worst.avg.toFixed(2)} rating over ${worst.n} maps. Worth practising.` }); }
+
+  let ctP = 0, ctW = 0, tP = 0, tW = 0;
+  for (const g of games) { ctP += g.ctPlayed; ctW += g.ctWon; tP += g.tPlayed; tW += g.tWon; }
+  if (ctP >= 10 && tP >= 10) {
+    const ctPct = (ctW / ctP) * 100, tPct = (tW / tP) * 100;
+    if (Math.abs(ctPct - tPct) >= 8) out.push(ctPct > tPct
+      ? { icon: "🛡️", text: `Stronger on CT side — ${ctPct.toFixed(0)}% round wins vs ${tPct.toFixed(0)}% on T.` }
+      : { icon: "🔫", text: `Stronger on T side — ${tPct.toFixed(0)}% round wins vs ${ctPct.toFixed(0)}% on CT.` });
+  }
+
+  const openTot = me.openingKills + me.openingDeaths;
+  if (openTot >= 20) {
+    const op = (me.openingKills / openTot) * 100, perMap = me.openingKills / me.matches;
+    if (op >= 55 && perMap >= 3) out.push({ icon: "🚪", text: `Entry-fragger profile — wins ${op.toFixed(0)}% of opening duels (${perMap.toFixed(1)}/map).` });
+  }
+  if (me.clutchAttempts >= 8) {
+    const cl = (me.clutchesWon / me.clutchAttempts) * 100;
+    if (cl >= 40) out.push({ icon: "🧊", text: `Clutch specialist — ${me.clutchesWon}/${me.clutchAttempts} clutches won (${cl.toFixed(0)}%).` });
+  }
+  const weps = topWeapons(me.weapons, 1);
+  if (weps.length && weps[0][1] >= 10) { const [w, n] = weps[0]; const isAwp = /awp/i.test(w); out.push({ icon: isAwp ? "🎯" : "🔧", text: `${isAwp ? "AWP main" : "Signature weapon"}: ${w.replace(/_/g, " ")} — ${n} kills.` }); }
+  if (me.matches >= 5 && me.utilityDamage / me.matches >= 60 && me.assists / me.matches >= 6)
+    out.push({ icon: "🤝", text: `Support tendencies — high utility damage (${Math.round(me.utilityDamage / me.matches)}/map) and assists.` });
+
+  if (games.length >= 6) {
+    const avg = avgOf(games), sd = Math.sqrt(games.reduce((s, g) => s + (g.rating - avg) ** 2, 0) / games.length);
+    out.push(sd <= 0.18
+      ? { icon: "🎚️", text: `Consistent performer — low rating variance (σ ${sd.toFixed(2)}).` }
+      : { icon: "🎢", text: `Streaky — high rating swings (σ ${sd.toFixed(2)}); big games and quiet ones.` });
+  }
+  return out;
+}
+
+// "Player Intelligence" — historic analysis of the signed-in user's per-map
+// records (`rawDocs`) plus their all-time aggregate (`me`): summary, rating
+// trend, insights, side split, per-map record, and recent match history.
+function playerIntelligence(rawDocs, me) {
+  const games = (rawDocs || []).map(normalizeGame)
+    .filter((g) => g.rounds > 0 || g.kills || g.deaths)
+    .sort((a, b) => a.date - b.date);   // oldest → newest
+  if (games.length < 2) return "";
+
+  const decided = games.filter((g) => g.result === "W" || g.result === "L");
+  const wins = decided.filter((g) => g.result === "W").length;
+  const losses = decided.length - wins;
+  const winPct = decided.length ? (wins / decided.length) * 100 : 0;
+
+  let streak = 0, streakType = null;
+  for (let i = games.length - 1; i >= 0; i--) {
+    const r = games[i].result;
+    if (r !== "W" && r !== "L") continue;
+    if (streakType === null) { streakType = r; streak = 1; }
+    else if (r === streakType) streak++;
+    else break;
+  }
+  const streakTxt = streakType ? `${streak}${streakType}` : "—";
+
+  const insights = playerInsights(games, me);
+  const insightHtml = insights.length
+    ? `<ul class="space-y-1.5">${insights.map((it) => `<li class="flex gap-2 text-xs text-slate-300"><span class="shrink-0">${it.icon}</span><span>${esc(it.text)}</span></li>`).join("")}</ul>`
+    : `<div class="text-xs text-slate-500">Play a few more maps to unlock insights.</div>`;
+
+  const stat = (label, value, sub = "") => `
+    <div class="rounded-lg bg-slate-950/40 border border-slate-800 p-3 text-center">
+      <div class="text-[10px] uppercase tracking-wide text-slate-500">${label}</div>
+      <div class="text-xl font-black font-mono leading-tight">${value}</div>
+      ${sub ? `<div class="text-[10px] text-slate-500">${sub}</div>` : ""}
+    </div>`;
+
+  return `
+    <div class="bg-panel rounded-xl p-4 border border-slate-800 space-y-4">
+      <div>
+        <div class="text-sm font-bold">🧠 Player Intelligence</div>
+        <div class="text-xs text-slate-500">Historic analysis across ${games.length} maps with round data</div>
+      </div>
+      <div class="grid grid-cols-2 sm:grid-cols-4 gap-2.5">
+        ${stat("Maps", String(games.length))}
+        ${stat("Record", `${wins}-${losses}`, decided.length ? `${winPct.toFixed(0)}% win` : "")}
+        ${stat("Avg rating", me ? me.rating.toFixed(2) : "—")}
+        ${stat("Current streak", streakTxt, streakType === "W" ? "on a roll" : streakType === "L" ? "bounce back" : "")}
+      </div>
+      ${playerTrendChart(games)}
+      <div class="grid grid-cols-1 lg:grid-cols-2 gap-4">
+        <div class="space-y-2">
+          <div class="text-[11px] uppercase tracking-wide text-slate-500">Insights</div>
+          ${insightHtml}
+        </div>
+        <div class="space-y-3">${sideSplitPanel(games)}</div>
+      </div>
+      <div class="space-y-2">
+        <div class="text-[11px] uppercase tracking-wide text-slate-500">Map performance</div>
+        ${mapPerformanceTable(games)}
+      </div>
+      <div class="space-y-2">
+        <div class="text-[11px] uppercase tracking-wide text-slate-500">Recent matches</div>
+        ${matchHistoryList(games)}
+      </div>
+    </div>`;
+}
+
 function renderDashboard() {
   const scope = urlScope;
   // The per-championship view needs a championship id; offer that tab only when
@@ -2026,6 +2308,9 @@ function renderDashboard() {
   }
   const players = aggregatePlayers(rows);
   if (scope === "championship") players.forEach((p) => { p.potm = potmByKey[p.key] || 0; });
+  // Historic / intelligence analytics — global scope only, where every row is
+  // the signed-in user's own game (so win/loss and trends are personal).
+  const intelligence = scope === "global" ? playerIntelligence(csGlobalStats, players[0]) : "";
 
   // Keep compare selection valid against the players actually present.
   compareKeys = compareKeys.filter((k) => players.some((p) => p.key === k));
@@ -2059,6 +2344,7 @@ function renderDashboard() {
       </div>
       ${compare}
       ${recordsWall}
+      ${intelligence}
       <div class="bg-panel rounded-xl p-4 border border-slate-800 space-y-3">
         <div>
           <div class="text-sm font-bold">Player Dashboard</div>
