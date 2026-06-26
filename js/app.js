@@ -723,12 +723,12 @@ function renderHome() {
           </div>
           ${crew ? `<div class="bg-ink border border-slate-800 rounded-xl p-4 shadow-xl">${teamManagePanel()}</div>` : ""}
         </div>
-        <div class="bg-ink border border-slate-800 rounded-xl p-4 shadow-xl">
+        ${crew ? `<div class="bg-ink border border-slate-800 rounded-xl p-4 shadow-xl">
           ${mapPoolSection()}
-        </div>
+        </div>` : ""}
       </div>
     </div>`);
-  initMapSort();
+  if (crew) initMapSort();
 }
 
 // ---- Name a new championship ---------------------------------------------
