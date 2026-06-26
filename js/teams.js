@@ -12,8 +12,6 @@ export const MAP_POOL = [
   "Nuke",
   "Vertigo",
   "Overpass",
-  "Office",
-  "Italy",
   "Train",
 ];
 
@@ -29,8 +27,6 @@ const MAP_ICONS = {
   Nuke: "img/maps/de_nuke.png",
   Overpass: "img/maps/de_overpass.png",
   Vertigo: "img/maps/de_vertigo.png",
-  Office: "img/maps/cs_office.png",
-  Italy: "img/maps/cs_italy.png",
   Train: "img/maps/de_train.png",
 };
 
@@ -64,13 +60,14 @@ const RAW_TEAMS = [
   { name: "Lynn Vision", tag: "LV", logo: "lynn", players: ["Westmelon", "z4KR", "Starry", "EmiliaQAQ", "C4LLM3SU3"] },
   { name: "NRG", tag: "NRG", logo: "nrg", players: ["nitr0", "Sonic", "oSee", "br0", "Grim"] },
   { name: "BetBoom", tag: "BB", logo: "bb", players: ["Boombl4", "S1ren", "d1Ledez", "zorte", "Magnojez"] },
-  { name: "9z", tag: "9Z", logo: "9z", players: ["exp", "Luchov", "Meyern", "HUASOPEEK", "Max"] },
+  { name: "FlyQuest", tag: "FLY", logo: "fq", players: ["jks", "INS", "Vexite", "nettik", "story"] },
   { name: "fnatic", tag: "FNC", logo: "fntc", players: ["KRIMZ", "Br4tkO", "fEAR", "jambo", "jackasmo"] },
   { name: "TYLOO", tag: "TYL", logo: "tyl", players: ["JamYoung", "Jee", "Mercury", "Moseyuh", "Zero"] },
   { name: "Fluxo", tag: "FLX", logo: "flux", players: ["Lucaozy", "zevy", "decenty", "kye", "exit"] },
   { name: "Monte", tag: "MTE", logo: "mont", players: ["Bymas", "afro", "Gizmy", "AZUWU", "Rainwaker"] },
   { name: "BESTIA", tag: "BES", logo: "bes", players: ["nacho", "cass1n", "buda", "tomaszin", "timo"] },
   { name: "BIG", tag: "BIG", logo: "big", players: ["tabseN", "JDC", "faveN", "blameF", "gr1ks"] },
+  { name: "Os Cachorro Mago", tag: "OCM", logo: "ocm", players: ["KRLITOS", "davirodriguesfl", "device", "sirah", "rain"] },
 ];
 
 function slug(name) {
@@ -81,12 +78,11 @@ function slug(name) {
 // https://github.com/lootmarket/esport-team-logos). Teams without one fall
 // back to the generated tag avatar in the UI.
 const TEAM_LOGOS = new Set([
-  "9z",
   "3dmax", "astralis", "aurora", "b8", "bestia", "betboom", "big", "falcons",
   "faze", "fluxo", "fnatic", "furia-esports", "g2-esports", "gamerlegion",
   "heroic", "legacy", "lynn-vision", "m80", "monte", "mouz", "natus-vincere",
   "ninjas-in-pyjamas", "nrg", "pain-gaming", "spirit", "team-liquid",
-  "team-vitality", "the-mongolz", "tyloo", "virtus-pro",
+  "team-vitality", "the-mongolz", "tyloo", "virtus-pro", "os-cachorro-mago",
 ]);
 
 // Local logo path for a team id, or null when none is available.

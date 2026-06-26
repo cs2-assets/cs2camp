@@ -68,17 +68,21 @@ export function groupLetter(idx) {
   return String.fromCharCode(65 + idx);
 }
 
-// All round-robin pairings (index pairs) for n teams.
-function roundRobinPairs(n) {
-  const pairs = [];
-  for (let i = 0; i < n; i++) {
-    for (let j = i + 1; j < n; j++) pairs.push([i, j]);
+// Round-robin pairings for n teams, grouped into rounds (circle method): each
+// round is a list of [i,j] index pairs in which every team plays exactly once.
+// n must be even (our groups/leagues always are). Returns (n-1) rounds.
+function roundRobinRounds(n) {
+  const rounds = [];
+  let rest = Array.from({ length: n - 1 }, (_, i) => i + 1); // 1..n-1, rotated each round
+  for (let r = 0; r < n - 1; r++) {
+    const row = [0, ...rest];
+    const pairs = [];
+    for (let i = 0; i < n / 2; i++) pairs.push([row[i], row[n - 1 - i]]);
+    rounds.push(pairs);
+    rest = [rest[rest.length - 1], ...rest.slice(0, rest.length - 1)]; // rotate
   }
-  return pairs;
+  return rounds;
 }
-
-// Round-robin pairings for a group of GROUP_SIZE teams (6 matches for 4 teams).
-const ROUND_ROBIN_PAIRS = roundRobinPairs(GROUP_SIZE);
 
 // Fisher-Yates shuffle (unbiased, unlike Array.sort).
 function shuffle(array, rng = Math.random) {
@@ -107,11 +111,12 @@ function playoffMatch(round, index) {
   };
 }
 
-function groupMatch(groupIdx, index, teamA, teamB, stage = "group") {
+function groupMatch(groupIdx, index, teamA, teamB, stage = "group", round = 0) {
   return {
     id: `g${groupIdx}-m${index}`,
     groupIdx,
     index,
+    round, // round-robin round (drives the progressive AI reveal)
     stage,
     teamA,
     teamB,
@@ -170,11 +175,14 @@ export function generateTournament(selectedTeamId, format = DEFAULT_FORMAT, rng 
 // Groups → single-elim playoffs (8 groups of 4 → 16-team bracket).
 function buildGroups(selectedTeamId, field) {
   const groups = [];
+  const roundPairs = roundRobinRounds(GROUP_SIZE);
   for (let g = 0; g < GROUP_COUNT; g++) {
     const members = field.slice(g * GROUP_SIZE, g * GROUP_SIZE + GROUP_SIZE);
-    const matches = ROUND_ROBIN_PAIRS.map(([i, j], k) =>
-      groupMatch(g, k, members[i], members[j])
-    );
+    const matches = [];
+    let k = 0;
+    roundPairs.forEach((pairs, round) => {
+      for (const [i, j] of pairs) matches.push(groupMatch(g, k++, members[i], members[j], "group", round));
+    });
     groups.push({ idx: g, name: `Group ${groupLetter(g)}`, teamIds: members.map((t) => t.id), matches });
   }
   return {
@@ -216,9 +224,11 @@ function buildSingleElim(selectedTeamId, field) {
 
 // Round-robin league: one table, everyone plays everyone once, no playoffs.
 function buildLeague(selectedTeamId, field) {
-  const matches = roundRobinPairs(field.length).map(([i, j], k) =>
-    groupMatch(0, k, field[i], field[j], "league")
-  );
+  const matches = [];
+  let k = 0;
+  roundRobinRounds(field.length).forEach((pairs, round) => {
+    for (const [i, j] of pairs) matches.push(groupMatch(0, k++, field[i], field[j], "league", round));
+  });
   return {
     format: "league",
     selectedTeamId,
@@ -654,6 +664,52 @@ export function seedPlayoffs(tournament) {
   tournament.currentStage = "ro16";
 }
 
+// ---- Progressive reveal --------------------------------------------------
+// The AI field stays in lockstep with the user instead of playing the whole
+// championship out up front. The user plays one match per round, so an AI match
+// at round R is only resolved once the user has finished R+1 of their own
+// matches (i.e. R < that count). Once the user can no longer add to the count
+// (eliminated, didn't qualify, or every personal match played) the limit lifts
+// so the remainder of the stage resolves to completion.
+
+// Count the user's own finished matches within a set.
+function userFinishedCount(tournament, matches) {
+  return matches.filter((m) => m.status === "finished" && involvesUser(tournament, m)).length;
+}
+
+// Round-robin (group / league) reveal limit. The user plays every one of their
+// matches, so their finished count alone drives the reveal.
+function groupRoundLimit(tournament) {
+  return userFinishedCount(tournament, tournament.groups.flatMap((g) => g.matches));
+}
+
+// Playoff bracket reveal limit. Infinity once the user can't progress further:
+// they never qualified for the bracket, or a single-elim loss knocked them out.
+function bracketRoundLimit(tournament) {
+  const rounds = tournament.rounds || [];
+  const userId = tournament.selectedTeamId;
+  const seeded = (rounds[0] || []).some((m) => involvesUser(tournament, m));
+  if (!seeded) return Infinity;
+  const played = rounds.flat().filter((m) => m.status === "finished" && involvesUser(tournament, m));
+  if (played.some((m) => m.winnerId && m.winnerId !== userId)) return Infinity; // eliminated
+  return played.length;
+}
+
+// Swiss reveal limit. Infinity once the user has qualified or been eliminated,
+// so the rest of the Swiss stage can play out and seed the playoff bracket.
+function swissRoundLimit(tournament) {
+  const sw = tournament.swiss;
+  const rec = (sw.records && sw.records[tournament.selectedTeamId]) || { w: 0, l: 0 };
+  if (rec.w >= SWISS_WINS || rec.l >= SWISS_LOSSES) return Infinity;
+  return userFinishedCount(tournament, sw.rounds.flat());
+}
+
+// An AI match is hidden while its round is at/beyond the current reveal limit.
+// Matches without a numeric round (double-elim) are never gated.
+function gated(round, limit) {
+  return Number.isFinite(round) && round >= limit;
+}
+
 // Resolve every playable match that does not involve the user's team, cascading
 // winners forward, until the whole tournament is stable. Dispatches per format.
 export function resolveAiMatches(tournament, rng = Math.random) {
@@ -671,9 +727,11 @@ export function resolveAiMatches(tournament, rng = Math.random) {
 // Auto-resolve a list of bracket-style matches, propagating each winner.
 function resolveBracket(tournament, matches, rng) {
   let changed = false;
+  const limit = bracketRoundLimit(tournament);
   for (const m of matches) {
     if (m.status === "finished" || !m.teamA || !m.teamB) continue;
     if (involvesUser(tournament, m)) continue;
+    if (gated(m.round, limit)) continue;
     autoResolveMatch(m, rng);
     if (m.status === "finished") { advanceWinner(tournament, m); changed = true; }
   }
@@ -684,10 +742,12 @@ function resolveBracket(tournament, matches, rng) {
 function resolveStandard(tournament, rng) {
   let changed = false;
   if (tournament.phase === "group") {
+    const limit = groupRoundLimit(tournament);
     for (const group of tournament.groups) {
       for (const m of group.matches) {
         if (m.status === "finished" || !m.teamA || !m.teamB) continue;
         if (involvesUser(tournament, m)) continue;
+        if (gated(m.round, limit)) continue;
         autoResolveMatch(m, rng);
         if (m.status === "finished") changed = true;
       }
@@ -709,10 +769,12 @@ function resolveSwiss(tournament, rng) {
   let changed = false;
   if (tournament.phase === "swiss") {
     const sw = tournament.swiss;
+    const limit = swissRoundLimit(tournament);
     const round = sw.rounds[sw.rounds.length - 1];
     for (const m of round) {
       if (m.status === "finished" || !m.teamA || !m.teamB) continue;
       if (involvesUser(tournament, m)) continue;
+      if (gated(m.swissRound, limit)) continue;
       autoResolveMatch(m, rng);
       if (m.status === "finished") changed = true;
     }
@@ -732,14 +794,16 @@ function resolveDouble(tournament, rng) {
 // ---- Winner propagation --------------------------------------------------
 
 // Place a finished playoff match's winner into its next-round slot and unlock
-// it. Group matches have no `round` and do not propagate here — they feed the
-// bracket through seedPlayoffs() once the group stage is complete.
+// it. Group matches do not propagate here — they feed the bracket through
+// seedPlayoffs() once the group stage is complete.
 export function advanceWinner(tournament, match) {
   // Double-elim has its own winner/loser routing.
   if (tournament.format === "double") return advanceDouble(tournament, match);
   // Group/league and Swiss-stage matches don't propagate through `rounds`
-  // (groups seed via seedPlayoffs; Swiss progresses in the resolver). Only
-  // bracket matches carry a numeric `round`.
+  // (groups seed via seedPlayoffs; Swiss progresses in the resolver). Group
+  // matches carry a `round` too (for the progressive reveal), so identify them
+  // by `groupIdx`; only true bracket matches have a numeric `round` and no group.
+  if (typeof match.groupIdx === "number") return;
   if (typeof match.round !== "number") return;
   if (match.status !== "finished" || !match.winnerId) return;
   const winner = teamById(tournament, match.winnerId);
