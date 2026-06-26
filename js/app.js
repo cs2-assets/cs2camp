@@ -1317,7 +1317,8 @@ function renderMatch() {
         ${controls}
       </div>
       <div class="order-3">${teamPanel(match.teamB, match)}</div>
-    </div>`,
+    </div>
+    ${seriesCsPanel(match)}`,
     { back: { href: urlBracket(championshipId), label: "Bracket" } });
 }
 
@@ -1497,16 +1498,25 @@ function csScoreboard(cs) {
     </div>`;
 }
 
+// The player whose per-round perspective ("won"/economy) anchors a match view —
+// preferring a tracked "my team" member, then the signed-in user, then anyone.
+// Returns null for an empty match.
+function refPlayer(cs) {
+  const players = (cs && cs.players) || [];
+  const myNames = (cs && cs.myTeam && cs.myTeam.players) || [];
+  return players.find((p) => myNames.includes(p.nickname))
+    || (user && players.find((p) => p.userId === user.uid))
+    || players[0]
+    || null;
+}
+
 // Round momentum + per-team economy strip for one match. Derives "my team" from
 // the tracked player so it survives the halftime side swap; degrades to "" when
 // the per-round data isn't present.
 function momentumPanel(cs) {
   const players = cs.players || [];
   if (!players.length) return "";
-  const myNames = (cs.myTeam && cs.myTeam.players) || [];
-  const ref = players.find((p) => myNames.includes(p.nickname))
-    || (user && players.find((p) => p.userId === user.uid))
-    || players[0];
+  const ref = refPlayer(cs);
   const refRounds = (ref && ref.rounds) || [];
   if (!refRounds.length) return "";
 
@@ -1556,6 +1566,123 @@ function momentumPanel(cs) {
         <div class="text-[10px] text-slate-500">Economy · enemy</div>
         <div class="flex flex-wrap gap-1">${enEcoCells.join("")}</div>` : ""}
       ${legend}
+    </div>`;
+}
+
+// The uploaded CS matches for a series' played maps, in play order (skips maps
+// the plugin hasn't uploaded). Each played map i maps to picked map i's UUID.
+function seriesCsMatches(match) {
+  const ids = (match.veto && match.veto.mapIds) || [];
+  return (match.mapsPlayed || [])
+    .map((_, i) => ({ cs: csMatchCache[ids[i]], picked: match.veto && match.veto.picked && match.veto.picked[i], i }))
+    .filter((e) => e.cs && Array.isArray(e.cs.players) && e.cs.players.length);
+}
+
+// Series MVP: the top-rated player aggregated across every uploaded map of the
+// series (so a player who carried two maps outranks a one-map spike). null when
+// no CS data is uploaded for the series yet.
+function seriesMvp(match) {
+  const entries = seriesCsMatches(match);
+  if (!entries.length) return null;
+  const rows = entries.flatMap(({ cs }) =>
+    cs.players.map((pl) => csPlayerRow({ ...pl, map: pl.map || cs.map })));
+  return aggregatePlayers(rows)[0] || null;
+}
+
+// Cumulative round-win differential (your team minus enemy) across the whole
+// series, concatenating each map's rounds in play order. Returns the segments
+// and the running point list, or null when no per-round data is present.
+function seriesMomentum(match) {
+  const entries = seriesCsMatches(match);
+  if (!entries.length) return null;
+  const segments = [];
+  const points = [];        // running differential after each round across the series
+  let diff = 0, idx = 0;
+  for (const { cs, picked } of entries) {
+    const ref = refPlayer(cs);
+    const rounds = (ref && ref.rounds) || [];
+    if (!rounds.length) continue;
+    const start = idx;
+    if (!points.length) points.push({ x: 0, d: 0 });
+    rounds.forEach((r) => {
+      diff += r.won ? 1 : -1;
+      idx += 1;
+      points.push({ x: idx, d: diff });
+    });
+    segments.push({ map: cs.map || picked || `Map ${segments.length + 1}`, start, end: idx, endDiff: diff });
+  }
+  return points.length > 1 ? { segments, points, total: idx } : null;
+}
+
+// SVG line chart of series momentum: x = round index across all maps, y = round
+// differential (above the midline = your team ahead). Map boundaries are marked.
+function seriesMomentumGraph(match) {
+  const data = seriesMomentum(match);
+  if (!data) return "";
+  const { segments, points, total } = data;
+  const W = 100, H = 40, mid = H / 2;
+  const maxAbs = Math.max(1, ...points.map((p) => Math.abs(p.d)));
+  const px = (x) => (x / total) * W;
+  const py = (d) => mid - (d / maxAbs) * (mid - 2);
+  const path = points.map((p) => `${px(p.x).toFixed(2)},${py(p.d).toFixed(2)}`).join(" ");
+  // Vertical separators between maps, plus a faint zero (tied) midline.
+  const seps = segments.slice(0, -1).map((s) =>
+    `<line x1="${px(s.end).toFixed(2)}" y1="0" x2="${px(s.end).toFixed(2)}" y2="${H}" stroke="rgb(100 116 139 / 0.3)" stroke-width="0.4" stroke-dasharray="1.5 1.5" />`).join("");
+  const endDot = (() => {
+    const last = points[points.length - 1];
+    const cls = last.d > 0 ? "rgb(52 211 153)" : last.d < 0 ? "rgb(248 113 113)" : "rgb(148 163 184)";
+    return `<circle cx="${px(last.x).toFixed(2)}" cy="${py(last.d).toFixed(2)}" r="1" fill="${cls}" />`;
+  })();
+  // Per-map labels with the running differential at the end of each map.
+  const labels = segments.map((s) => {
+    const sign = s.endDiff > 0 ? "+" : "";
+    const cls = s.endDiff > 0 ? "text-emerald-400" : s.endDiff < 0 ? "text-red-400" : "text-slate-400";
+    return `<span class="flex items-center gap-1">${mapIconImg(s.map, "h-3.5 w-3.5")}<span class="text-slate-400">${esc(s.map)}</span>
+      <span class="font-mono ${cls}">${sign}${s.endDiff}</span></span>`;
+  }).join("");
+  return `
+    <div class="space-y-2">
+      <div class="text-[11px] text-slate-400">Series momentum
+        <span class="text-slate-600">(cumulative round lead across all maps — above the line means your team is ahead)</span></div>
+      <svg viewBox="0 0 ${W} ${H}" preserveAspectRatio="none" class="w-full h-24 rounded bg-slate-950/40">
+        <line x1="0" y1="${mid}" x2="${W}" y2="${mid}" stroke="rgb(100 116 139 / 0.4)" stroke-width="0.4" />
+        ${seps}
+        <polyline points="${path}" fill="none" stroke="rgb(245 158 11)" stroke-width="1.2"
+          vector-effect="non-scaling-stroke" stroke-linejoin="round" stroke-linecap="round" />
+        ${endDot}
+      </svg>
+      <div class="flex flex-wrap gap-x-4 gap-y-1 text-[10px]">${labels}</div>
+    </div>`;
+}
+
+// Combined CS summary for a series page: Series MVP badge + series momentum
+// graph. Empty string until the plugin has uploaded at least one map.
+function seriesCsPanel(match) {
+  const graph = seriesMomentumGraph(match);
+  const mvp = seriesMvp(match);
+  if (!graph && !mvp) return "";
+  const maps = seriesCsMatches(match).length;
+  const mvpCard = mvp
+    ? `<div class="bg-gradient-to-r from-accent/15 to-amber-500/10 border border-accent/40 rounded-xl p-4 flex items-center justify-between gap-3">
+        <div class="flex items-center gap-3 min-w-0">
+          <div class="text-2xl">🏆</div>
+          <div class="min-w-0">
+            <div class="text-[10px] uppercase tracking-widest text-accent">Series MVP</div>
+            <div class="font-bold truncate">${esc(mvp.nickname)}</div>
+            <div class="text-[11px] text-slate-500">across ${mvp.matches} of ${maps} map${maps === 1 ? "" : "s"}</div>
+          </div>
+        </div>
+        <div class="text-right shrink-0 font-mono text-sm">
+          <div>${ratingCell(mvp.rating)} <span class="text-[10px] text-slate-500">rating</span></div>
+          <div class="text-[11px] text-slate-400">${mvp.kills}-${mvp.deaths}-${mvp.assists} · ${mvp.adr.toFixed(0)} ADR</div>
+        </div>
+      </div>`
+    : "";
+  return `
+    <div class="mt-4 bg-panel rounded-xl p-4 border border-slate-800 space-y-4">
+      <div class="text-xs uppercase tracking-wide text-slate-500">Series breakdown</div>
+      ${mvpCard}
+      ${graph ? `<div class="pt-1">${graph}</div>` : ""}
     </div>`;
 }
 
@@ -1727,13 +1854,17 @@ function comparePanel(players) {
 
 // Leaderboard table shared by both dashboard scopes. Rows expand to an insight
 // panel; the checkbox selects players for head-to-head comparison.
-function dashboardTable(players) {
+function dashboardTable(players, { potm = false } = {}) {
   if (!players.length) {
     return `<p class="text-slate-500 text-sm">No CS match data yet. Play a map with its Match ID and your plugin's upload will appear here.</p>`;
   }
+  const colspan = potm ? 14 : 13;
   const body = players.map((p, idx) => {
     const open = expandedPlayer === p.key;
     const checked = compareKeys.includes(p.key);
+    const potmCell = potm
+      ? `<td class="px-2 text-center font-mono ${p.potm ? "text-accent font-bold" : "text-slate-500"}">${p.potm ? `👑 ${p.potm}` : "—"}</td>`
+      : "";
     const row = `
     <tr class="border-t border-slate-800 ${open ? "bg-slate-800/30" : ""}">
       <td class="py-1.5 pr-1 text-center">
@@ -1755,9 +1886,10 @@ function dashboardTable(players) {
       <td class="px-2 text-center font-mono">${p.hsPct.toFixed(0)}%</td>
       <td class="px-2 text-center font-mono">${p.kast.toFixed(0)}%</td>
       <td class="px-2 text-center font-mono">${p.mvps}</td>
+      ${potmCell}
     </tr>`;
     const detail = open
-      ? `<tr><td colspan="13" class="px-2 pb-3">${playerInsightPanel(p)}</td></tr>`
+      ? `<tr><td colspan="${colspan}" class="px-2 pb-3">${playerInsightPanel(p)}</td></tr>`
       : "";
     return row + detail;
   }).join("");
@@ -1792,10 +1924,70 @@ function dashboardTable(players) {
             ${th("HS%", "Headshot percentage — share of this player's kills that were headshots.")}
             ${th("KAST", "Share of rounds with a Kill, Assist, Survived, or was Traded — a consistency/impact measure. ~70%+ is good.")}
             ${th("MVP", "Most Valuable Player awards — rounds where this player had the biggest impact.")}
+            ${potm ? th("POTM", "Player of the Match — maps in this championship where this player finished with the top rating.") : ""}
           </tr>
         </thead>
         <tbody>${body}</tbody>
       </table>
+    </div>`;
+}
+
+// Highest multi-kill tier (5/4/3/2) a player reached in one game, or 0.
+function maxMultiKill(multi) {
+  for (const [tier, k] of [[5, "k5"], [4, "k4"], [3, "k3"], [2, "k2"]]) {
+    if (csNum(multi && multi[k]) > 0) return tier;
+  }
+  return 0;
+}
+
+// "Personal records wall" — the user's best single-map performances pulled from
+// their per-player-match docs (one doc = one map they played). Each card names
+// the map and date the record was set. Shown only on the all-time (global)
+// scope, where every row is the signed-in user's own game.
+function personalRecordsWall(rawDocs) {
+  const games = (rawDocs || []).map((d) => ({ row: csPlayerRow(d), date: d.endedAtUtc }));
+  if (!games.length) return "";
+
+  // [icon, label, metric, formatter] — metric returns 0/null to skip a game.
+  const specs = [
+    ["🎯", "Best rating", (r) => r.rating, (v) => v.toFixed(2)],
+    ["💀", "Most kills", (r) => r.kills, (v) => String(v)],
+    ["⚔️", "Best K/D", (r) => (r.deaths ? r.kills / r.deaths : r.kills), (v) => v.toFixed(2)],
+    ["🔥", "Top ADR", (r) => r.adr, (v) => v.toFixed(0)],
+    ["🚪", "Opening kills", (r) => r.openingKills, (v) => String(v)],
+    ["🧊", "Clutches won", (r) => r.clutchesWon, (v) => String(v)],
+    ["💥", "Biggest multi-kill", (r) => maxMultiKill(r.multiKills), (v) => `${v}K`],
+    ["🎯", "Best HS%", (r) => (r.kills >= 5 ? r.hsPct : 0), (v) => `${v.toFixed(0)}%`],
+  ];
+
+  const cards = specs.map(([icon, label, metric, fmt]) => {
+    let best = null, bestVal = 0;
+    for (const g of games) {
+      const v = metric(g.row);
+      if (v > bestVal) { bestVal = v; best = g; }
+    }
+    if (!best || bestVal <= 0) return "";
+    const mapName = best.row.map || "";
+    const when = fmtCsDate(best.date);
+    const ctx = [mapName, when].filter(Boolean).join(" · ");
+    return `
+      <div class="rounded-lg bg-slate-950/40 border border-slate-800 p-3 flex flex-col gap-0.5">
+        <div class="text-[10px] uppercase tracking-wide text-slate-500 flex items-center gap-1"><span>${icon}</span>${esc(label)}</div>
+        <div class="text-xl font-black font-mono text-accent leading-tight">${fmt(bestVal)}</div>
+        <div class="text-[10px] text-slate-500 flex items-center gap-1 min-w-0">
+          ${mapName ? mapIconImg(mapName, "h-3.5 w-3.5") : ""}<span class="truncate">${esc(ctx)}</span>
+        </div>
+      </div>`;
+  }).filter(Boolean).join("");
+
+  if (!cards) return "";
+  return `
+    <div class="bg-panel rounded-xl p-4 border border-slate-800 space-y-3">
+      <div>
+        <div class="text-sm font-bold">🏅 Personal records</div>
+        <div class="text-xs text-slate-500">Your best single-map performances across every championship</div>
+      </div>
+      <div class="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-4 gap-2.5">${cards}</div>
     </div>`;
 }
 
@@ -1813,20 +2005,27 @@ function renderDashboard() {
   };
 
   // Build the per-match rows for the active scope, then aggregate by player.
-  let rows = [], subtitle;
+  let rows = [], subtitle, recordsWall = "";
+  const potmByKey = {};   // championship scope: maps each player was top-rated in
   if (scope === "championship") {
     const uuids = new Set(allMapUuids(tournament));
     for (const id of uuids) {
       const cs = csMatchCache[id];
       // Inject the match's map onto each player so per-map form can aggregate.
-      if (cs && Array.isArray(cs.players)) rows.push(...cs.players.map((pl) => csPlayerRow({ ...pl, map: pl.map || cs.map })));
+      if (cs && Array.isArray(cs.players)) {
+        rows.push(...cs.players.map((pl) => csPlayerRow({ ...pl, map: pl.map || cs.map })));
+        const mvp = matchMvp(cs);
+        if (mvp) potmByKey[mvp.key] = (potmByKey[mvp.key] || 0) + 1;
+      }
     }
     subtitle = `${esc(championshipName || "Championship")} · players across all maps with uploaded CS data`;
   } else {
     rows = (csGlobalStats || []).map(csPlayerRow);
     subtitle = "Your all-time stats across every championship";
+    recordsWall = personalRecordsWall(csGlobalStats);
   }
   const players = aggregatePlayers(rows);
+  if (scope === "championship") players.forEach((p) => { p.potm = potmByKey[p.key] || 0; });
 
   // Keep compare selection valid against the players actually present.
   compareKeys = compareKeys.filter((k) => players.some((p) => p.key === k));
@@ -1835,7 +2034,7 @@ function renderDashboard() {
     ? `<div class="text-[11px] text-slate-500">Click a player for per-map form, weapons &amp; clutch stats · tick two to compare.</div>`
     : "";
 
-  let table = dashboardTable(players);
+  let table = dashboardTable(players, { potm: scope === "championship" });
   if (dashboardLoading) {
     table = `<p class="text-slate-400 text-sm">Loading stats…</p>`;
   } else if (dashboardError) {
@@ -1859,6 +2058,7 @@ function renderDashboard() {
         ${tab("global", "All-time (me)", true, urlDashboard("global"))}
       </div>
       ${compare}
+      ${recordsWall}
       <div class="bg-panel rounded-xl p-4 border border-slate-800 space-y-3">
         <div>
           <div class="text-sm font-bold">Player Dashboard</div>
