@@ -12,6 +12,7 @@ import {
   getCsPlayerMatchesByUser,
   getProfile,
   saveProfile,
+  saveMapOrder,
 } from "./db.js";
 import {
   generateTournament,
@@ -34,7 +35,7 @@ import {
 import { createVeto, currentAction, applyVeto, autoVetoOpponent, userOptions, chooseSide, needsUserSide, PICK_COUNT, BAN_COUNT } from "./veto.js";
 import { confirmDialog, alertDialog } from "./dialog.js";
 import { withLoading, setSaving } from "./loading.js";
-import { getMapOrder, setMapOrder, clearMapOrder } from "./prefs.js";
+import { getMapOrder, setMapOrder, clearMapOrder, reconcileMapOrder } from "./prefs.js";
 import { onAuth, signInWithGoogle, signOutUser } from "./auth.js";
 import { grantChampionReward } from "./rewards.js";
 import {
@@ -56,6 +57,7 @@ import Sortable from "sortablejs";
 
 let user = null;             // signed-in Firebase user (null when logged out)
 let userNickname = "";       // the user's CS nickname (from their profile doc)
+let userMapOrder = [];       // the user's saved map preference order (from profile)
 let profileLoaded = false;   // whether the profile fetch has completed this session
 let onboardingDismissed = false; // user skipped the nickname onboarding this session
 let crews = [];              // Teams the user belongs to
@@ -440,7 +442,7 @@ function championshipRow(c) {
 // ranked list (powered by SortableJS, see initMapSort): the order is the user's
 // team preference and drives the order of their veto pick/ban options.
 function mapPoolSection() {
-  const order = getMapOrder();
+  const order = currentMapOrder();
   const chips = order.map((m, i) => `
     <div data-map-chip="${esc(m)}"
       class="group flex items-center gap-2 bg-panel border border-slate-800 rounded-lg px-3 py-2 hover:border-accent/60 transition">
@@ -470,11 +472,19 @@ function initMapSort() {
     animation: 150,
     handle: "[data-drag-handle]",
     ghostClass: "opacity-40",
-    onEnd: () => {
+    onEnd: async () => {
       const order = Array.from(list.querySelectorAll("[data-map-chip]")).map((c) => c.dataset.mapChip);
-      setMapOrder(order);
+      userMapOrder = order;
+      setMapOrder(order);   // localStorage cache for instant first paint
       // Renumber ranks in place (no full re-render needed).
       list.querySelectorAll("[data-map-chip] [data-rank]").forEach((el, i) => { el.textContent = i + 1; });
+      // Persist to the user's profile in Firestore.
+      if (user) {
+        setSaving(true);
+        try { await saveMapOrder(user.uid, order); }
+        catch (e) { console.error("save map order failed", e); }
+        finally { setSaving(false); }
+      }
     },
   });
 }
@@ -1125,7 +1135,7 @@ function vetoPanel(match) {
     const done = action.type === "ban" ? ballot.bans.length : ballot.picks.length;
     const total = action.type === "ban" ? BAN_COUNT : PICK_COUNT;
     // Present the options in the user's saved preference order.
-    const pref = getMapOrder();
+    const pref = currentMapOrder();
     const maps = userOptions(veto)
       .slice()
       .sort((x, y) => pref.indexOf(x) - pref.indexOf(y))
@@ -1899,6 +1909,13 @@ async function onClick(e) {
 
     case "reset-map-order":
       clearMapOrder();
+      userMapOrder = [];
+      if (user) {
+        setSaving(true);
+        try { await saveMapOrder(user.uid, []); }
+        catch (e) { console.error("reset map order failed", e); }
+        finally { setSaving(false); }
+      }
       return render();
 
     case "sign-in":
@@ -2296,7 +2313,7 @@ async function main() {
     if (!user) {
       crews = []; invites = []; championships = []; allChampionships = [];
       tournament = null; championshipId = null; championshipName = "";
-      userNickname = ""; profileLoaded = false; onboardingDismissed = false;
+      userNickname = ""; userMapOrder = []; profileLoaded = false; onboardingDismissed = false;
       return render();
     }
     try {
@@ -2321,12 +2338,22 @@ async function loadUserProfile() {
   try {
     const prof = user ? await getProfile(user.uid) : null;
     userNickname = (prof && prof.nickname) || "";
+    userMapOrder = (prof && Array.isArray(prof.mapOrder)) ? prof.mapOrder : [];
+    // Mirror the saved order into the localStorage cache for fast first paint.
+    if (userMapOrder.length) setMapOrder(userMapOrder);
   } catch (e) {
     console.error("profile load failed", e);
     userNickname = "";
+    userMapOrder = [];
   } finally {
     profileLoaded = true;
   }
+}
+
+// The user's preferred map order: their saved profile order if set, else the
+// localStorage cache — always reconciled against the current map pool.
+function currentMapOrder() {
+  return (userMapOrder && userMapOrder.length) ? reconcileMapOrder(userMapOrder) : getMapOrder();
 }
 
 // Load the data this page needs, addressed by the URL query string.

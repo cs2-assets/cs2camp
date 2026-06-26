@@ -8,15 +8,20 @@ import { MAP_POOL } from "./teams.js";
 
 const MAP_ORDER_KEY = "cs2.mapOrder";
 
-// The map pool in the user's preferred order. Reconciled with the current pool:
-// stale maps are dropped and any newly-added maps are appended at the end, so a
-// changed MAP_POOL never breaks the saved preference.
+// Reconcile a saved order with the current pool: drop stale maps and append any
+// newly-added maps at the end, so a changed MAP_POOL never breaks a saved order.
+export function reconcileMapOrder(saved) {
+  const arr = Array.isArray(saved) ? saved : [];
+  const ranked = arr.filter((m) => MAP_POOL.includes(m));
+  const rest = MAP_POOL.filter((m) => !ranked.includes(m));
+  return [...ranked, ...rest];
+}
+
+// The map pool in the user's preferred order, from the localStorage cache.
 export function getMapOrder() {
   let saved = [];
   try { saved = JSON.parse(localStorage.getItem(MAP_ORDER_KEY)) || []; } catch { saved = []; }
-  const ranked = saved.filter((m) => MAP_POOL.includes(m));
-  const rest = MAP_POOL.filter((m) => !ranked.includes(m));
-  return [...ranked, ...rest];
+  return reconcileMapOrder(saved);
 }
 
 export function setMapOrder(order) {

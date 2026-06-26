@@ -196,6 +196,15 @@ export async function saveProfile(uid, nickname) {
   return record;
 }
 
+// Persist the user's map preference order onto their profile (merge: leaves the
+// nickname untouched). An empty array resets the preference.
+export async function saveMapOrder(uid, order) {
+  if (!uid) throw new Error("saveMapOrder: missing uid");
+  const mapOrder = Array.isArray(order) ? order : [];
+  await setDoc(doc(db, PROFILE_COLLECTION, uid), { uid, mapOrder, updatedAt: Date.now() }, { merge: true });
+  return mapOrder;
+}
+
 // Firestore Timestamp | millis | Date -> millis (best-effort, 0 if unknown).
 function toMillis(v) {
   if (!v) return 0;
