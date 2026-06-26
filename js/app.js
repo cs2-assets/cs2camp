@@ -10,6 +10,8 @@ import {
   deleteChampionship,
   getCsMatches,
   getCsPlayerMatchesByUser,
+  getProfile,
+  saveProfile,
 } from "./db.js";
 import {
   generateTournament,
@@ -23,8 +25,11 @@ import {
   computeStandings,
   groupStageComplete,
   groupLetter,
+  deAllMatches,
   STAGES,
   STAGE_LABELS,
+  FORMATS,
+  DEFAULT_FORMAT,
 } from "./engine.js";
 import { createVeto, currentAction, applyVeto, autoVetoOpponent, userOptions, chooseSide, needsUserSide, PICK_COUNT, BAN_COUNT } from "./veto.js";
 import { confirmDialog, alertDialog } from "./dialog.js";
@@ -50,6 +55,9 @@ import Sortable from "sortablejs";
 // ---- State ---------------------------------------------------------------
 
 let user = null;             // signed-in Firebase user (null when logged out)
+let userNickname = "";       // the user's CS nickname (from their profile doc)
+let profileLoaded = false;   // whether the profile fetch has completed this session
+let onboardingDismissed = false; // user skipped the nickname onboarding this session
 let crews = [];              // Teams the user belongs to
 let invites = [];            // pending Team invites (by email)
 let activeCrewId = null;     // currently selected Team
@@ -58,8 +66,31 @@ let tournament = null;       // active in-memory Tournament snapshot
 let championshipId = null;   // id of the active saved championship record
 let championshipName = "";    // its display name
 let championships = [];        // metadata list shown on the home screen
-let view = { name: "home", matchId: null };
 const app = () => document.getElementById("app");
+
+// ---- Multi-page routing --------------------------------------------------
+// Each destination is a separate HTML file. The page name comes from
+// <body data-page="…"> (set by the build), and everything else needed to
+// rebuild this page's state is read from the URL query string. Cross-page
+// navigation is a real page load via go(); only in-page interactions re-render.
+const PAGE = (document.body && document.body.dataset.page) || "home";
+const params = new URLSearchParams(location.search);
+const urlMatchId = params.get("match") || null;        // match.html / match-info.html
+const urlMapIdx = params.has("map") ? parseInt(params.get("map"), 10) : null; // match-info.html
+const urlScope = params.get("scope") === "global" ? "global" : "championship"; // dashboard.html
+
+// Home-page create wizard sub-state (home → name → select → new-crew). Only the
+// home page uses this; the other pages are addressed by their own URL.
+let homeView = "home";
+let pendingName = "";
+let pendingFormat = DEFAULT_FORMAT;   // chosen championship format for the new championship
+
+function go(url) { location.assign(url); }
+const urlHome = () => "index.html";
+const urlBracket = (id) => `bracket.html?id=${encodeURIComponent(id)}`;
+const urlMatch = (id, mId) => `match.html?id=${encodeURIComponent(id)}&match=${encodeURIComponent(mId)}`;
+const urlMatchInfo = (id, mId, idx) => `match-info.html?id=${encodeURIComponent(id)}&match=${encodeURIComponent(mId)}&map=${idx}`;
+const urlDashboard = (scope, id) => `dashboard.html?scope=${scope}${id ? `&id=${encodeURIComponent(id)}` : ""}`;
 
 // Cache of CS extractor match data keyed by map UUID. Populated lazily when a
 // match screen or dashboard is opened; absence means "not fetched / not yet
@@ -68,6 +99,8 @@ let csMatchCache = {};
 let csGlobalStats = null;   // cached per-player records for the global dashboard
 let dashboardLoading = false;
 let dashboardError = null;  // last dashboard fetch error message, or null
+let expandedPlayer = null;  // dashboard: player key whose insight panel is open
+let compareKeys = [];       // dashboard: up to 2 player keys selected to compare
 
 const ACTIVE_CREW_KEY = "cs2.activeCrewId";
 function activeCrew() {
@@ -213,12 +246,15 @@ async function copyToClipboard(text) {
 
 // ---- CS extractor integration --------------------------------------------
 
-// Every match in the tournament (group round-robins + playoff bracket), flat.
+// Every match in the tournament across all formats (groups, brackets, Swiss
+// rounds, double-elim winners/losers/grand-final), flat.
 function allMatches(t) {
   const out = [];
   if (!t) return out;
   for (const g of t.groups || []) for (const m of g.matches || []) out.push(m);
   for (const round of t.rounds || []) for (const m of round || []) out.push(m);
+  if (t.swiss) for (const round of t.swiss.rounds || []) for (const m of round) out.push(m);
+  if (t.de) out.push(...deAllMatches(t));
   return out;
 }
 
@@ -300,19 +336,6 @@ function mapCsScore(match, mapIdx, cs) {
   return { scoreA: ct, scoreB: t };
 }
 
-// Pull CS data for every map UUID in a match into the cache, then re-render if
-// the user is still looking at that match. Safe to call repeatedly.
-async function prefetchCsForMatch(matchId) {
-  const m = findMatch(tournament, matchId);
-  if (!m || !m.veto || !m.veto.complete) return;
-  const uuids = (m.veto.mapIds || []).filter(Boolean);
-  if (!uuids.length) return;
-  try {
-    Object.assign(csMatchCache, await getCsMatches(uuids));
-    if (view.name === "match" && view.matchId === matchId) render();
-  } catch (e) { console.error("CS prefetch failed", e); }
-}
-
 // CS2 map icon (from MurkyYT/cs2-map-icons). Falls back to nothing if unknown.
 function mapIconImg(name, size = "h-5 w-5") {
   const src = mapIcon(name);
@@ -327,14 +350,21 @@ function mapIconImg(name, size = "h-5 w-5") {
 
 function render() {
   if (!user) return renderSignIn();
-  if (view.name === "new-crew") return renderNewCrew();
-  if (view.name === "name") return renderName();
-  if (view.name === "select") return renderSelect();
-  if (view.name === "bracket") return renderBracket();
-  if (view.name === "match") return renderMatch();
-  if (view.name === "match-info") return renderMatchInfo();
-  if (view.name === "dashboard") return renderDashboard();
-  return renderHome();
+  // First-run onboarding: ask for the CS nickname before anything else (once the
+  // profile has loaded and the user hasn't set or skipped it).
+  if (profileLoaded && !userNickname && !onboardingDismissed) return renderOnboarding();
+  switch (PAGE) {
+    case "bracket": return renderBracket();
+    case "match": return renderMatch();
+    case "info": return renderMatchInfo();
+    case "dashboard": return renderDashboard();
+    default:
+      // Home page hosts the create wizard as in-page steps.
+      if (homeView === "new-crew") return renderNewCrew();
+      if (homeView === "name") return renderName();
+      if (homeView === "select") return renderSelect();
+      return renderHome();
+  }
 }
 
 // Signed-in user chip + sign-out, shown in the header. Empty when logged out.
@@ -352,9 +382,12 @@ function userChip() {
 }
 
 function shell(inner, opts = {}) {
+  // Back link: an href crosses pages (real load); an action runs in-page.
+  const backCls = "text-slate-400 hover:text-accent transition text-sm flex items-center gap-1";
   const back = opts.back
-    ? `<button data-action="${opts.back.action}"
-        class="text-slate-400 hover:text-accent transition text-sm flex items-center gap-1">&larr; ${esc(opts.back.label)}</button>`
+    ? (opts.back.href
+        ? `<a href="${esc(opts.back.href)}" class="${backCls}">&larr; ${esc(opts.back.label)}</a>`
+        : `<button data-action="${opts.back.action}" class="${backCls}">&larr; ${esc(opts.back.label)}</button>`)
     : "";
   const reset = (tournament && championshipId)
     ? `<button data-action="reset" class="text-xs text-slate-500 hover:text-red-400 transition">Delete championship</button>`
@@ -472,6 +505,59 @@ function renderSignIn() {
     </div>`;
 }
 
+// A copyable line showing the signed-in user's Firebase User ID — paste it into
+// the CS extractor plugin so your matches are tagged to this account.
+function uidLine() {
+  if (!user) return "";
+  return `
+    <div class="flex items-center gap-2 text-xs">
+      <span class="uppercase tracking-wide text-slate-500 shrink-0">User ID</span>
+      <span class="font-mono text-slate-400 truncate" title="${esc(user.uid)}">${esc(user.uid)}</span>
+      <button data-action="copy-uid" data-id="${esc(user.uid)}"
+        class="px-2 py-0.5 rounded bg-slate-800 hover:bg-slate-700 text-slate-200 transition shrink-0"
+        title="Copy your User ID">Copy</button>
+    </div>`;
+}
+
+// First-run onboarding: capture the user's CS nickname (and surface their User
+// ID to copy into the plugin). Reached from render() until a nickname is set.
+function renderOnboarding() {
+  app().innerHTML = `
+    ${bgLayer()}
+    <div class="min-h-screen grid place-items-center px-4">
+      <div class="bg-ink border border-slate-800 rounded-2xl p-8 shadow-2xl space-y-5 max-w-sm w-full">
+        <div class="text-center space-y-1">
+          <h1 class="text-2xl font-black tracking-tight">Welcome${user && user.displayName ? `, ${esc(user.displayName.split(" ")[0])}` : ""}!</h1>
+          <p class="text-sm text-slate-400">What's your in-game CS nickname? We use it to match your match stats to you.</p>
+        </div>
+        <input data-nick-input type="text" maxlength="40" value="${esc(userNickname)}"
+          class="w-full bg-slate-800 rounded-lg px-4 py-3 text-base outline-none focus:ring-2 focus:ring-accent" />
+        <button data-action="save-nickname"
+          class="w-full px-4 py-3 rounded-lg bg-accent text-ink font-bold hover:brightness-110 transition">Save &amp; continue</button>
+        <div class="pt-3 border-t border-slate-800 space-y-2">
+          <p class="text-[11px] text-slate-500">Configure your CS server plugin with this ID so uploaded matches link to your account:</p>
+          ${uidLine()}
+        </div>
+        <div class="text-center">
+          <button data-action="skip-onboarding" class="text-xs text-slate-500 hover:text-slate-300 transition">Skip for now</button>
+        </div>
+      </div>
+    </div>`;
+  const input = document.querySelector("[data-nick-input]");
+  if (input) input.focus();
+}
+
+// Shown on a deep-linked page (bracket/match/dashboard) when its championship
+// can't be loaded — bad id, deleted, or no access. Offers a way home.
+function renderMissingChampionship() {
+  shell(`
+    <div class="max-w-md mx-auto bg-panel rounded-xl p-6 border border-slate-800 text-center space-y-3">
+      <div class="text-slate-300 font-semibold">Championship not found</div>
+      <p class="text-sm text-slate-500">It may have been deleted, or you don't have access to it.</p>
+      <a href="${esc(urlHome())}" class="inline-block px-4 py-2 rounded-lg bg-accent text-ink font-semibold text-sm">Go home</a>
+    </div>`, { back: { href: urlHome(), label: "Home" } });
+}
+
 // Inline "name a new team" screen (mirrors renderName).
 function renderNewCrew() {
   shell(`
@@ -576,6 +662,24 @@ function teamManagePanel() {
     </div>`;
 }
 
+// Account card on the home page: edit the CS nickname and copy the User ID.
+function accountPanel() {
+  return `
+    <div class="bg-ink/90 border border-slate-800 rounded-xl p-4 shadow-xl space-y-3">
+      <div class="text-xs uppercase tracking-wide text-slate-500">Your CS profile</div>
+      <div class="flex flex-col sm:flex-row sm:items-end gap-2">
+        <label class="flex-1 min-w-0">
+          <span class="block text-[11px] text-slate-500 mb-1">CS nickname</span>
+          <input data-nick-input type="text" maxlength="40" value="${esc(userNickname)}"
+            class="w-full bg-slate-800 rounded-lg px-3 py-2 text-sm outline-none focus:ring-2 focus:ring-accent" />
+        </label>
+        <button data-action="save-nickname"
+          class="px-4 py-2 rounded-lg bg-accent text-ink font-bold text-sm hover:brightness-110 transition shrink-0">Save</button>
+      </div>
+      ${uidLine()}
+    </div>`;
+}
+
 function renderHome() {
   const crew = activeCrew();
   const list = championships.length
@@ -595,6 +699,7 @@ function renderHome() {
         ${teamSwitcher()}
         ${invitesBanner()}
       </div>
+      ${accountPanel()}
       <div class="text-center flex items-center justify-center gap-3">
         ${createBtn}
         <button data-action="dashboard" data-scope="global"
@@ -620,14 +725,31 @@ function renderHome() {
 
 function renderName() {
   const suggestion = `Championship ${championships.length + 1}`;
+  const formatCards = Object.values(FORMATS).map((f) => {
+    const active = pendingFormat === f.key;
+    return `
+      <button data-action="set-format" data-format="${f.key}"
+        class="text-left rounded-xl p-3 border transition ${active ? "border-accent bg-accent/10" : "border-slate-800 bg-panel hover:border-slate-600"}">
+        <div class="flex items-center justify-between gap-2">
+          <span class="font-bold text-sm ${active ? "text-accent" : ""}">${esc(f.label)}</span>
+          <span class="text-[10px] text-slate-500 shrink-0">${f.field} teams</span>
+        </div>
+        <div class="text-[11px] text-slate-400 leading-snug mt-1">${esc(f.blurb)}</div>
+      </button>`;
+  }).join("");
+
   shell(`
     <div class="max-w-md mx-auto space-y-4 pt-6">
       <div>
         <h2 class="text-2xl font-bold">Name your championship</h2>
         <p class="text-slate-400 text-sm">Give this tournament a name so you can find it later.</p>
       </div>
-      <input data-name-input type="text" maxlength="60" placeholder="${esc(suggestion)}"
+      <input data-name-input type="text" maxlength="60" placeholder="${esc(suggestion)}" value="${esc(pendingName)}"
         class="w-full bg-slate-800 rounded-lg px-4 py-3 text-base outline-none focus:ring-2 focus:ring-accent" />
+      <div class="space-y-2">
+        <div class="text-xs uppercase tracking-wide text-slate-500">Format</div>
+        <div class="grid grid-cols-1 gap-2">${formatCards}</div>
+      </div>
       <div class="flex gap-2">
         <button data-action="name-submit"
           class="px-6 py-3 rounded-lg bg-accent text-ink font-bold hover:brightness-110 transition">Continue</button>
@@ -641,6 +763,7 @@ function renderName() {
 // ---- Team selection -------------------------------------------------------
 
 function renderSelect() {
+  const fmt = FORMATS[pendingFormat] || FORMATS[DEFAULT_FORMAT];
   const cards = TEAMS.map((t) => `
     <button data-action="select-team" data-team="${t.id}"
       class="group text-left bg-panel rounded-xl p-4 border border-slate-800 hover:border-accent
@@ -658,8 +781,9 @@ function renderSelect() {
   shell(`
     <div class="mb-4">
       <h2 class="text-2xl font-bold">Choose your team</h2>
-      <p class="text-slate-400 text-sm">The other 31 slots are drawn at random from the remaining ${TEAMS.length - 1} teams,
-        then split into 8 groups of 4. Top 2 of each group reach the Round of 16.</p>
+      <p class="text-slate-400 text-sm">
+        <span class="text-accent font-semibold">${esc(fmt.label)}</span> · the other ${fmt.field - 1}
+        slots are drawn at random from the remaining ${TEAMS.length - 1} teams. ${esc(fmt.blurb)}</p>
     </div>
     <div class="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-4 xl:grid-cols-5 gap-3">${cards}</div>`,
     { back: { action: "goto-home", label: "Home" } });
@@ -705,16 +829,18 @@ function matchCard(match) {
 }
 
 // One row of a group standings table.
-function standingRow(stat, rank, complete) {
+function standingRow(stat, rank, complete, advanceCount = 2) {
   const team = teamById(tournament, stat.teamId);
-  const advancing = rank < 2; // top 2 qualify
+  const advancing = rank < advanceCount;
   const mapDiff = stat.mapsWon - stat.mapsLost;
   const diffStr = mapDiff > 0 ? `+${mapDiff}` : `${mapDiff}`;
   const rankCls = advancing ? "text-emerald-400" : "text-slate-600";
   const rowCls = advancing ? "bg-emerald-500/5" : "";
   const ring = isUserTeam(team) ? "ring-1 ring-accent" : "";
+  // League (advanceCount 1): the leader is the champion; groups: top N qualify.
   const qual = advancing && complete
-    ? '<span class="text-[9px] font-bold text-emerald-400">Q</span>' : "";
+    ? (advanceCount === 1 ? '<span class="text-[10px]">👑</span>' : '<span class="text-[9px] font-bold text-emerald-400">Q</span>')
+    : "";
   return `
     <div class="flex items-center gap-2 px-1.5 py-1 rounded ${rowCls} ${ring}">
       <span class="w-3 text-center text-xs font-bold ${rankCls}">${rank + 1}</span>
@@ -756,7 +882,8 @@ function groupCard(group) {
   const complete = group.matches.every((m) => m.status === "finished");
   const standings = computeStandings(tournament, group);
   const hasUser = group.teamIds.includes(tournament.selectedTeamId);
-  const rows = standings.map((s, i) => standingRow(s, i, complete)).join("");
+  const advanceCount = tournament.format === "league" ? 1 : 2;
+  const rows = standings.map((s, i) => standingRow(s, i, complete, advanceCount)).join("");
   const pills = group.matches.map(groupMatchPill).join("");
   return `
     <div class="bg-panel border ${hasUser ? "border-accent/50" : "border-slate-800"} rounded-xl p-3 space-y-2">
@@ -770,7 +897,45 @@ function groupCard(group) {
     </div>`;
 }
 
+// Render an array of bracket rounds as labeled columns of match cards.
+function bracketCols(rounds, labelOf) {
+  return rounds.map((round, r) => `
+    <div class="flex flex-col min-w-[11rem]">
+      <div class="text-center text-xs font-bold uppercase tracking-wide mb-3 text-slate-500">${esc(labelOf(r))}</div>
+      <div class="flex flex-col gap-3 justify-around flex-1">${round.map(matchCard).join("")}</div>
+    </div>`).join("");
+}
+
+// Compact Swiss records table: every team by record, with qualified/eliminated.
+function swissRecordsTable() {
+  const sw = tournament.swiss;
+  const ids = tournament.teams.map((t) => t.id)
+    .sort((a, b) => (sw.records[b].w - sw.records[a].w) || (sw.records[a].l - sw.records[b].l));
+  const rows = ids.map((id) => {
+    const r = sw.records[id];
+    const team = teamById(tournament, id);
+    const q = r.w >= 3, e = r.l >= 3;
+    const badge = q ? '<span class="text-[9px] font-bold text-emerald-400">Q</span>'
+      : e ? '<span class="text-[9px] font-bold text-red-400">OUT</span>' : "";
+    const rowCls = q ? "bg-emerald-500/5" : e ? "opacity-50" : "";
+    const ring = isUserTeam(team) ? "ring-1 ring-accent" : "";
+    return `
+      <div class="flex items-center gap-2 px-1.5 py-1 rounded ${rowCls} ${ring}">
+        ${avatar(team, "h-5 w-5 text-[8px]")}
+        <span class="text-xs truncate flex-1">${esc(team.name)}</span>
+        ${badge}
+        <span class="text-[11px] font-mono ${r.w > r.l ? "text-emerald-300" : r.l > r.w ? "text-red-300" : "text-slate-400"}">${r.w}-${r.l}</span>
+      </div>`;
+  }).join("");
+  return `
+    <div class="bg-panel border border-slate-800 rounded-xl p-3 space-y-0.5">
+      <div class="text-xs uppercase tracking-wide text-slate-500 mb-1">Records · 3 wins qualify · 3 losses out</div>
+      ${rows}
+    </div>`;
+}
+
 function renderBracket() {
+  if (!tournament) return renderMissingChampionship();
   const champ = tournament.champion;
   const banner = champ
     ? `<div class="mb-6 rounded-xl p-5 text-center bg-gradient-to-r from-accent/20 to-emerald-500/20 border border-accent">
@@ -784,51 +949,112 @@ function renderBracket() {
       </div>`
     : "";
 
+  const format = tournament.format || "groups";
+  const stages = (tournament.stages && tournament.stages.length) ? tournament.stages : STAGES;
   const groupsDone = groupStageComplete(tournament);
   const groupsActive = tournament.currentStage === "group";
 
-  // Group stage section: 8 group cards with live standings + match pills.
+  // --- Group / league section ---
   const groupCards = tournament.groups.map(groupCard).join("");
-  const groupsSection = `
-    <section class="mb-8">
-      <div class="flex items-center gap-3 mb-3">
-        <h3 class="text-sm font-bold uppercase tracking-wide ${groupsActive ? "text-accent" : "text-slate-400"}">Group Stage</h3>
-        <span class="text-xs text-slate-500">8 groups of 4 · top 2 advance</span>
-      </div>
-      <div class="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-3">${groupCards}</div>
-    </section>`;
+  const groupsSection = format === "league"
+    ? `<section class="mb-8 max-w-xl mx-auto">
+        <div class="flex items-center gap-3 mb-3">
+          <h3 class="text-sm font-bold uppercase tracking-wide text-accent">League Table</h3>
+          <span class="text-xs text-slate-500">round robin · top of the table wins</span>
+        </div>
+        ${groupCards}
+      </section>`
+    : `<section class="mb-8">
+        <div class="flex items-center gap-3 mb-3">
+          <h3 class="text-sm font-bold uppercase tracking-wide ${groupsActive ? "text-accent" : "text-slate-400"}">Group Stage</h3>
+          <span class="text-xs text-slate-500">8 groups of 4 · top 2 advance</span>
+        </div>
+        <div class="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-3">${groupCards}</div>
+      </section>`;
 
-  // Playoff bracket section (TBD slots until the group stage seeds it).
+  // --- Playoff bracket section ---
   const columns = tournament.rounds.map((round, r) => {
-    const active = STAGES[r] === tournament.currentStage && !champ;
+    const active = stages[r] === tournament.currentStage && !champ;
     const cards = round.map(matchCard).join("");
     return `
       <div class="flex flex-col min-w-[11rem]">
         <div class="text-center text-xs font-bold uppercase tracking-wide mb-3
-          ${active ? "text-accent" : "text-slate-500"}">${STAGE_LABELS[STAGES[r]]}</div>
+          ${active ? "text-accent" : "text-slate-500"}">${STAGE_LABELS[stages[r]] || ""}</div>
         <div class="flex flex-col gap-3 justify-around flex-1">${cards}</div>
       </div>`;
   }).join("");
+  const bracketLocked = format === "groups" && !groupsDone;
+  const showPlayoffHeader = format === "groups" || (format === "swiss" && tournament.rounds.length);
   const playoffSection = `
     <section>
-      <div class="flex items-center gap-3 mb-3">
-        <h3 class="text-sm font-bold uppercase tracking-wide ${!groupsActive && !champ ? "text-accent" : "text-slate-400"}">Playoffs</h3>
-        ${groupsDone ? "" : '<span class="text-xs text-slate-500">unlocks after the group stage</span>'}
-      </div>
-      <div class="overflow-x-auto pb-4 ${groupsDone ? "" : "opacity-50"}">
+      ${showPlayoffHeader ? `
+        <div class="flex items-center gap-3 mb-3">
+          <h3 class="text-sm font-bold uppercase tracking-wide ${!groupsActive && !champ ? "text-accent" : "text-slate-400"}">Playoffs</h3>
+          ${format === "groups" && !groupsDone ? '<span class="text-xs text-slate-500">unlocks after the group stage</span>' : ""}
+        </div>` : ""}
+      <div class="overflow-x-auto pb-4 ${bracketLocked ? "opacity-50" : ""}">
         <div class="flex gap-6 items-stretch min-w-max">${columns}</div>
       </div>
     </section>`;
 
+  // --- Swiss section (records + each round's matches) ---
+  let swissSection = "";
+  if (format === "swiss") {
+    const swissCols = bracketCols(tournament.swiss.rounds, (r) => `Round ${r + 1}`);
+    swissSection = `
+      <section class="mb-8">
+        <div class="flex items-center gap-3 mb-3">
+          <h3 class="text-sm font-bold uppercase tracking-wide ${tournament.phase === "swiss" ? "text-accent" : "text-slate-400"}">Swiss Stage</h3>
+          <span class="text-xs text-slate-500">pairs by record · 3 wins qualify, 3 losses out</span>
+        </div>
+        <div class="grid grid-cols-1 lg:grid-cols-[18rem_1fr] gap-4">
+          ${swissRecordsTable()}
+          <div class="overflow-x-auto pb-2"><div class="flex gap-6 items-stretch min-w-max">${swissCols}</div></div>
+        </div>
+      </section>`;
+  }
+
+  // --- Double-elimination section (winners + losers brackets + grand final) ---
+  let doubleSection = "";
+  if (format === "double") {
+    const de = tournament.de;
+    const wbCols = bracketCols(de.wb, (r) => ["Round 1", "Semifinals", "Final"][r] || "");
+    const lbCols = bracketCols(de.lb, (r) => ["Round 1", "Round 2", "Round 3", "Final"][r] || "");
+    const wrap = (cols) => `<div class="overflow-x-auto pb-2"><div class="flex gap-6 items-stretch min-w-max">${cols}</div></div>`;
+    doubleSection = `
+      <section class="space-y-5">
+        <div>
+          <h3 class="text-sm font-bold uppercase tracking-wide text-emerald-400 mb-3">Winners Bracket</h3>
+          ${wrap(wbCols)}
+        </div>
+        <div>
+          <h3 class="text-sm font-bold uppercase tracking-wide text-amber-400 mb-3">Losers Bracket</h3>
+          ${wrap(lbCols)}
+        </div>
+        <div>
+          <h3 class="text-sm font-bold uppercase tracking-wide text-accent mb-3">Grand Final</h3>
+          <div class="flex">${matchCard(de.gf)}</div>
+        </div>
+      </section>`;
+  }
+
+  // Compose sections per format.
+  const body =
+    format === "single" ? playoffSection
+    : format === "league" ? groupsSection
+    : format === "swiss" ? `${swissSection}${tournament.rounds.length ? playoffSection : ""}`
+    : format === "double" ? doubleSection
+    : `${groupsSection}${playoffSection}`;
+
   shell(`
     ${banner}
-    <div class="flex justify-end mb-3">
+    <div class="flex items-center justify-between mb-3">
+      <span class="text-xs text-slate-500">${esc((FORMATS[format] || {}).label || "")}</span>
       <button data-action="dashboard" data-scope="championship"
         class="px-3 py-1.5 rounded-lg bg-slate-800 hover:bg-slate-700 text-slate-200 transition text-sm font-semibold">📊 Player Stats</button>
     </div>
-    ${groupsSection}
-    ${playoffSection}`,
-    { back: { action: "goto-home", label: "Home" } });
+    ${body}`,
+    { back: { href: urlHome(), label: "Home" } });
 }
 
 // ---- Match view -----------------------------------------------------------
@@ -1042,8 +1268,9 @@ function mapsPanel(match) {
 }
 
 function renderMatch() {
-  const match = findMatch(tournament, view.matchId);
-  if (!match) { view = { name: "bracket" }; return render(); }
+  if (!tournament) return renderMissingChampionship();
+  const match = findMatch(tournament, urlMatchId);
+  if (!match) { go(urlBracket(championshipId)); return; }
 
   let a = 0, b = 0;
   for (const m of match.mapsPlayed) {
@@ -1055,15 +1282,17 @@ function renderMatch() {
   const controls = finished
     ? `<div class="rounded-lg bg-emerald-500/10 border border-emerald-500/40 p-3 text-center">
          <div class="text-emerald-300 font-bold">${esc(winner.name)} wins the series ${a}–${b}</div>
-         <button data-action="goto-bracket" class="mt-2 px-4 py-2 rounded bg-accent text-ink font-semibold text-sm">Back to Bracket</button>
+         <a href="${esc(urlBracket(championshipId))}" class="inline-block mt-2 px-4 py-2 rounded bg-accent text-ink font-semibold text-sm">Back to Bracket</a>
        </div>`
     : `<div class="rounded-lg bg-slate-800/60 border border-slate-700 p-3 text-center text-sm text-slate-400">
          Enter each map's score above to decide the series (first to 2 maps).
        </div>`;
 
-  const stageLabel = typeof match.groupIdx === "number"
-    ? `Group ${groupLetter(match.groupIdx)} · Group Stage`
-    : STAGE_LABELS[match.stage];
+  const stageLabel = match.stageLabel
+    ? match.stageLabel
+    : typeof match.groupIdx === "number"
+      ? `Group ${groupLetter(match.groupIdx)} · Group Stage`
+      : STAGE_LABELS[match.stage];
 
   shell(`
     <div class="mb-4 text-center">
@@ -1079,57 +1308,105 @@ function renderMatch() {
       </div>
       <div class="order-3">${teamPanel(match.teamB, match)}</div>
     </div>`,
-    { back: { action: "goto-bracket", label: "Bracket" } });
+    { back: { href: urlBracket(championshipId), label: "Bracket" } });
 }
 
 // ---- CS match info & player dashboards ------------------------------------
 
 const csNum = (v) => Number(v) || 0;
 
+// Approximate HLTV Rating 2.0 from box-score stats. Uses the widely-cited
+// public regression: KAST (as a percent), per-round kill/death/assist rates, an
+// impact term, and ADR. A balanced player averages ~1.00; ~1.15+ is excellent.
+function csRating({ kills, deaths, assists, rounds, adr, kast }) {
+  const rp = rounds || 1;
+  const kpr = kills / rp, dpr = deaths / rp, apr = assists / rp;
+  const impact = 2.13 * kpr + 0.42 * apr - 0.41;
+  const r = 0.0073 * kast + 0.3591 * kpr - 0.5329 * dpr + 0.2372 * impact + 0.0032 * adr + 0.1587;
+  return Math.max(0, r);
+}
+
 // Normalize a player record (from a match's players[] OR a player_match doc)
-// into the flat shape the scoreboard and aggregation use.
+// into the flat shape the scoreboard and aggregation use. `p.map` (depot name)
+// is present on player_match docs and injected for a match's players[].
 function csPlayerRow(p) {
   const adv = p.advanced || {};
-  return {
+  const rounds = csNum(adv.roundsPlayed) || csNum(p.roundsPlayed) || csNum(p.totalRounds);
+  const row = {
     key: p.userId || p.nickname || "?",
     nickname: p.nickname || p.userId || "Unknown",
     team: (p.team || "").toUpperCase(),
+    map: p.map || "",
     kills: csNum(p.kills),
     deaths: csNum(p.deaths),
     assists: csNum(p.assists),
     hsKills: csNum(p.headshotKills),
     mvps: csNum(p.mvps),
     score: csNum(p.score),
-    rounds: csNum(adv.roundsPlayed) || csNum(p.roundsPlayed) || csNum(p.totalRounds),
+    rounds,
     kastRounds: csNum(adv.kastRounds),
     adr: csNum(adv.adr),
     kast: csNum(adv.kast),
     hsPct: csNum(adv.headshotPercent),
+    // Insight extras.
+    openingKills: csNum(adv.openingKills),
+    openingDeaths: csNum(adv.openingDeaths),
+    clutchesWon: csNum(adv.clutchesWon),
+    clutchAttempts: csNum(adv.clutchAttempts),
+    utilityDamage: csNum(adv.utilityDamage) || csNum(p.utilityDamage),
+    weaponKills: adv.weaponKills || {},
+    multiKills: adv.multiKills || {},
   };
+  row.rating = csRating(row);
+  return row;
 }
 
 // Aggregate many per-match player rows into one row per player, recomputing
-// rate stats (ADR/KAST/HS%) precisely from the underlying totals.
+// rate stats (ADR/KAST/HS%/rating) precisely from the underlying totals and
+// rolling up the insight breakdowns (per-map, weapons, opening/clutch/multi).
 function aggregatePlayers(rows) {
   const byKey = new Map();
   for (const r of rows) {
     let g = byKey.get(r.key);
-    if (!g) { g = { key: r.key, nickname: r.nickname, matches: 0, kills: 0, deaths: 0, assists: 0, hsKills: 0, mvps: 0, rounds: 0, adrSum: 0, kastRounds: 0 }; byKey.set(r.key, g); }
+    if (!g) {
+      g = { key: r.key, nickname: r.nickname, matches: 0, kills: 0, deaths: 0, assists: 0, hsKills: 0, mvps: 0,
+            rounds: 0, adrSum: 0, kastRounds: 0, openingKills: 0, openingDeaths: 0, clutchesWon: 0, clutchAttempts: 0,
+            utilityDamage: 0, multi: { k2: 0, k3: 0, k4: 0, k5: 0 }, weapons: {}, perMap: new Map() };
+      byKey.set(r.key, g);
+    }
     if (r.nickname) g.nickname = r.nickname;
     g.matches += 1;
     g.kills += r.kills; g.deaths += r.deaths; g.assists += r.assists;
     g.hsKills += r.hsKills; g.mvps += r.mvps; g.rounds += r.rounds;
     g.adrSum += r.adr * r.rounds;      // round-weighted so the average is exact
     g.kastRounds += r.kastRounds;
+    g.openingKills += r.openingKills; g.openingDeaths += r.openingDeaths;
+    g.clutchesWon += r.clutchesWon; g.clutchAttempts += r.clutchAttempts;
+    g.utilityDamage += r.utilityDamage;
+    for (const k of ["k2", "k3", "k4", "k5"]) g.multi[k] += csNum(r.multiKills[k]);
+    for (const [w, n] of Object.entries(r.weaponKills || {})) g.weapons[w] = (g.weapons[w] || 0) + csNum(n);
+    if (r.map) {
+      const pm = g.perMap.get(r.map) || { map: r.map, kills: 0, deaths: 0, rounds: 0, adrSum: 0 };
+      pm.kills += r.kills; pm.deaths += r.deaths; pm.rounds += r.rounds; pm.adrSum += r.adr * r.rounds;
+      g.perMap.set(r.map, pm);
+    }
   }
-  return [...byKey.values()].map((g) => ({
-    ...g,
-    kd: g.deaths ? g.kills / g.deaths : g.kills,
-    adr: g.rounds ? g.adrSum / g.rounds : 0,
-    kast: g.rounds ? (g.kastRounds / g.rounds) * 100 : 0,
-    hsPct: g.kills ? (g.hsKills / g.kills) * 100 : 0,
-  })).sort((a, b) => (b.kd - a.kd) || (b.kills - a.kills));
+  return [...byKey.values()].map((g) => {
+    const adr = g.rounds ? g.adrSum / g.rounds : 0;
+    const kast = g.rounds ? (g.kastRounds / g.rounds) * 100 : 0;
+    return {
+      ...g,
+      kd: g.deaths ? g.kills / g.deaths : g.kills,
+      adr, kast,
+      hsPct: g.kills ? (g.hsKills / g.kills) * 100 : 0,
+      rating: csRating({ kills: g.kills, deaths: g.deaths, assists: g.assists, rounds: g.rounds, adr, kast }),
+      perMap: [...g.perMap.values()]
+        .map((pm) => ({ ...pm, kd: pm.deaths ? pm.kills / pm.deaths : pm.kills, adr: pm.rounds ? pm.adrSum / pm.rounds : 0 }))
+        .sort((x, y) => y.rounds - x.rounds),
+    };
+  }).sort((a, b) => (b.rating - a.rating) || (b.kd - a.kd));
 }
+
 
 function fmtDuration(secs) {
   const s = csNum(secs);
@@ -1160,12 +1437,30 @@ function roundStrip(rounds) {
   return `<div class="flex flex-wrap gap-1">${cells}</div>`;
 }
 
-// The detailed scoreboard for one extracted CS match.
+// Normalized, rating-sorted player rows for one extracted CS match.
+function matchPlayers(cs) {
+  return (cs.players || []).map(csPlayerRow).sort((a, b) => (b.rating - a.rating));
+}
+
+// The match's Player of the Match (highest rating), or null.
+function matchMvp(cs) {
+  return matchPlayers(cs)[0] || null;
+}
+
+function ratingCell(r) {
+  const cls = r >= 1.15 ? "text-emerald-400" : r >= 1 ? "text-emerald-300" : r >= 0.85 ? "text-slate-200" : "text-red-300";
+  return `<span class="font-bold ${cls}">${r.toFixed(2)}</span>`;
+}
+
+// The detailed scoreboard for one extracted CS match, sorted by rating, with the
+// Player of the Match marked.
 function csScoreboard(cs) {
-  const rows = (cs.players || []).map(csPlayerRow).sort((a, b) => (b.kills - a.kills));
+  const rows = matchPlayers(cs);
+  const mvpKey = rows[0] && rows[0].key;
   const body = rows.map((p) => `
-    <tr class="border-t border-slate-800">
-      <td class="py-1.5 pr-2 font-medium">${esc(p.nickname)} ${p.team ? sideBadge(p.team) : ""}</td>
+    <tr class="border-t border-slate-800 ${p.key === mvpKey ? "bg-accent/5" : ""}">
+      <td class="py-1.5 pr-2 font-medium">${p.key === mvpKey ? "👑 " : ""}${esc(p.nickname)} ${p.team ? sideBadge(p.team) : ""}</td>
+      <td class="px-2 text-center font-mono">${ratingCell(p.rating)}</td>
       <td class="px-2 text-center font-mono">${p.kills}</td>
       <td class="px-2 text-center font-mono">${p.deaths}</td>
       <td class="px-2 text-center font-mono">${p.assists}</td>
@@ -1181,6 +1476,7 @@ function csScoreboard(cs) {
         <thead class="text-slate-500 uppercase tracking-wide text-[10px]">
           <tr>
             <th class="py-1 pr-2 text-left">Player</th>
+            <th class="px-2" title="Approx HLTV Rating 2.0">RAT</th>
             <th class="px-2">K</th><th class="px-2">D</th><th class="px-2">A</th>
             <th class="px-2">K/D</th><th class="px-2">ADR</th><th class="px-2">HS%</th>
             <th class="px-2">KAST</th><th class="px-2">MVP</th>
@@ -1191,15 +1487,78 @@ function csScoreboard(cs) {
     </div>`;
 }
 
+// Round momentum + per-team economy strip for one match. Derives "my team" from
+// the tracked player so it survives the halftime side swap; degrades to "" when
+// the per-round data isn't present.
+function momentumPanel(cs) {
+  const players = cs.players || [];
+  if (!players.length) return "";
+  const myNames = (cs.myTeam && cs.myTeam.players) || [];
+  const ref = players.find((p) => myNames.includes(p.nickname))
+    || (user && players.find((p) => p.userId === user.uid))
+    || players[0];
+  const refRounds = (ref && ref.rounds) || [];
+  if (!refRounds.length) return "";
+
+  const myLabel = (ref.team || "").toUpperCase();
+  const mine = players.filter((p) => (p.team || "").toUpperCase() === myLabel);
+  const enemy = players.filter((p) => (p.team || "").toUpperCase() !== myLabel);
+  const half = csNum(cs.maxRounds) ? Math.floor(csNum(cs.maxRounds) / 2) : 12;
+
+  // Economy bucket from a team's total start money for the round.
+  const buy = (sum) => sum < 5000 ? { c: "bg-red-500/70", t: "eco" }
+    : sum < 20000 ? { c: "bg-yellow-500/70", t: "force" }
+    : { c: "bg-emerald-500/70", t: "full" };
+  const teamBuyAt = (team, idx) => buy(team.reduce((s, p) => s + csNum(p.rounds && p.rounds[idx] && p.rounds[idx].startMoney), 0));
+
+  let myScore = 0, enScore = 0;
+  const resultCells = [], myEcoCells = [], enEcoCells = [];
+  refRounds.forEach((r, idx) => {
+    const won = !!r.won;
+    if (won) myScore++; else enScore++;
+    const pistol = csNum(r.round) === 1 || csNum(r.round) === half + 1;
+    resultCells.push(`<span class="inline-block w-3 h-5 rounded-sm ${won ? "bg-emerald-500/80" : "bg-red-500/70"} ${pistol ? "ring-1 ring-white/60" : ""}"
+      title="Round ${csNum(r.round)} · ${won ? "won" : "lost"}${pistol ? " · pistol" : ""} · ${myScore}-${enScore}"></span>`);
+    const mb = teamBuyAt(mine, idx), eb = teamBuyAt(enemy, idx);
+    myEcoCells.push(`<span class="inline-block w-3 h-2 rounded-sm ${mb.c}" title="Round ${csNum(r.round)} · your team ${mb.t}"></span>`);
+    enEcoCells.push(`<span class="inline-block w-3 h-2 rounded-sm ${eb.c}" title="Round ${csNum(r.round)} · enemy ${eb.t}"></span>`);
+  });
+
+  const hasEco = mine.some((p) => (p.rounds || []).some((r) => csNum(r.startMoney)));
+  const legend = `
+    <div class="flex flex-wrap gap-3 text-[10px] text-slate-500">
+      <span class="flex items-center gap-1"><span class="inline-block w-2.5 h-2.5 rounded-sm bg-emerald-500/80"></span>won</span>
+      <span class="flex items-center gap-1"><span class="inline-block w-2.5 h-2.5 rounded-sm bg-red-500/70"></span>lost</span>
+      <span class="flex items-center gap-1"><span class="inline-block w-2.5 h-2.5 rounded-sm ring-1 ring-white/60"></span>pistol</span>
+      ${hasEco ? `<span class="text-slate-600">·</span>
+      <span class="flex items-center gap-1"><span class="inline-block w-2.5 h-2.5 rounded-sm bg-red-500/70"></span>eco</span>
+      <span class="flex items-center gap-1"><span class="inline-block w-2.5 h-2.5 rounded-sm bg-yellow-500/70"></span>force</span>
+      <span class="flex items-center gap-1"><span class="inline-block w-2.5 h-2.5 rounded-sm bg-emerald-500/70"></span>full</span>` : ""}
+    </div>`;
+
+  return `
+    <div class="space-y-2">
+      <div class="text-[11px] text-slate-400">Momentum <span class="text-slate-600">(your team's round-by-round result)</span></div>
+      <div class="flex flex-wrap gap-1">${resultCells.join("")}</div>
+      ${hasEco ? `
+        <div class="text-[10px] text-slate-500 mt-1">Economy · your team</div>
+        <div class="flex flex-wrap gap-1">${myEcoCells.join("")}</div>
+        <div class="text-[10px] text-slate-500">Economy · enemy</div>
+        <div class="flex flex-wrap gap-1">${enEcoCells.join("")}</div>` : ""}
+      ${legend}
+    </div>`;
+}
+
 function renderMatchInfo() {
-  const match = findMatch(tournament, view.matchId);
-  if (!match) { view = { name: "bracket" }; return render(); }
-  const i = view.mapIdx;
+  if (!tournament) return renderMissingChampionship();
+  const match = findMatch(tournament, urlMatchId);
+  if (!match) { go(urlBracket(championshipId)); return; }
+  const i = urlMapIdx;
   const uuid = match.veto && match.veto.mapIds && match.veto.mapIds[i];
   const cs = uuid && csMatchCache[uuid];
   const mapName = (match.veto && match.veto.picked && match.veto.picked[i]) || (cs && cs.map) || "Map";
 
-  const back = { action: "goto-match", label: "Match" };
+  const back = { href: urlMatch(championshipId, urlMatchId), label: "Match" };
   if (!cs) {
     shell(`
       <div class="max-w-2xl mx-auto bg-panel rounded-xl p-6 border border-slate-800 text-center text-slate-400">
@@ -1218,6 +1577,23 @@ function renderMatchInfo() {
     cs.serverHostname ? `srv: ${esc(cs.serverHostname)}` : "",
   ].filter(Boolean).join(" · ");
 
+  const mvp = matchMvp(cs);
+  const mvpCard = mvp
+    ? `<div class="bg-gradient-to-r from-accent/15 to-amber-500/10 border border-accent/40 rounded-xl p-4 flex items-center justify-between gap-3">
+        <div class="flex items-center gap-3 min-w-0">
+          <div class="text-2xl">👑</div>
+          <div class="min-w-0">
+            <div class="text-[10px] uppercase tracking-widest text-accent">Player of the Match</div>
+            <div class="font-bold truncate">${esc(mvp.nickname)} ${mvp.team ? sideBadge(mvp.team) : ""}</div>
+          </div>
+        </div>
+        <div class="text-right shrink-0 font-mono text-sm">
+          <div>${ratingCell(mvp.rating)} <span class="text-[10px] text-slate-500">rating</span></div>
+          <div class="text-[11px] text-slate-400">${mvp.kills}-${mvp.deaths}-${mvp.assists} · ${mvp.adr.toFixed(0)} ADR</div>
+        </div>
+      </div>`
+    : "";
+
   shell(`
     <div class="max-w-3xl mx-auto space-y-4">
       <div class="bg-panel rounded-xl p-5 border border-slate-800 text-center">
@@ -1231,7 +1607,11 @@ function renderMatchInfo() {
           ${sideBadge("CT")} <span class="text-slate-600">vs</span> ${sideBadge("T")} · winner ${winner ? sideBadge(winner) : "—"}
         </div>
         <div class="text-[11px] text-slate-500 mt-2">${meta}</div>
-        <div class="mt-3 flex justify-center">${roundStrip(cs.rounds)}</div>
+      </div>
+      ${mvpCard}
+      <div class="bg-panel rounded-xl p-4 border border-slate-800">
+        <div class="text-xs uppercase tracking-wide text-slate-500 mb-2">Momentum &amp; economy</div>
+        ${momentumPanel(cs) || roundStrip(cs.rounds)}
       </div>
       <div class="bg-panel rounded-xl p-4 border border-slate-800">
         <div class="text-xs uppercase tracking-wide text-slate-500 mb-2">Scoreboard</div>
@@ -1241,15 +1621,121 @@ function renderMatchInfo() {
     </div>`, { back });
 }
 
-// Leaderboard table shared by both dashboard scopes.
+// Top weapons by kills for a player's aggregated weaponKills.
+function topWeapons(weapons, n = 6) {
+  return Object.entries(weapons || {}).sort((a, b) => b[1] - a[1]).slice(0, n);
+}
+
+// Per-player insight panel: per-map form, top weapons, opening duels, clutches,
+// and multi-kills — all rolled up across the counted matches.
+function playerInsightPanel(p) {
+  const maps = p.perMap || [];
+  const mapRows = maps.length
+    ? maps.map((m) => `
+      <div class="flex items-center justify-between gap-2 text-[11px]">
+        <span class="flex items-center gap-1.5 min-w-0">${mapIconImg(m.map, "h-4 w-4")}<span class="truncate">${esc(m.map)}</span></span>
+        <span class="font-mono text-slate-400 shrink-0">${m.kills}-${m.deaths} · <span class="${m.kd >= 1 ? "text-emerald-400" : ""}">${m.kd.toFixed(2)} KD</span> · ${m.adr.toFixed(0)} ADR</span>
+      </div>`).join("")
+    : `<div class="text-[11px] text-slate-600">No per-map data.</div>`;
+
+  const weps = topWeapons(p.weapons);
+  const maxW = weps.length ? weps[0][1] : 1;
+  const wepRows = weps.length
+    ? weps.map(([w, n]) => `
+      <div class="flex items-center gap-2 text-[11px]">
+        <span class="w-20 shrink-0 truncate text-slate-300">${esc(w.replace(/_/g, " "))}</span>
+        <span class="flex-1 h-2 rounded bg-slate-800 overflow-hidden"><span class="block h-full bg-accent" style="width:${Math.round((n / maxW) * 100)}%"></span></span>
+        <span class="w-6 text-right font-mono text-slate-400">${n}</span>
+      </div>`).join("")
+    : `<div class="text-[11px] text-slate-600">No weapon data.</div>`;
+
+  const openTotal = p.openingKills + p.openingDeaths;
+  const openPct = openTotal ? Math.round((p.openingKills / openTotal) * 100) : 0;
+  const clPct = p.clutchAttempts ? Math.round((p.clutchesWon / p.clutchAttempts) * 100) : 0;
+  const splits = `
+    <div class="grid grid-cols-2 gap-x-4 gap-y-1 text-[11px]">
+      <div class="flex justify-between"><span class="text-slate-500">Opening duels</span><span class="font-mono">${p.openingKills}–${p.openingDeaths} <span class="text-slate-600">(${openPct}%)</span></span></div>
+      <div class="flex justify-between"><span class="text-slate-500">Clutches</span><span class="font-mono">${p.clutchesWon}/${p.clutchAttempts} <span class="text-slate-600">(${clPct}%)</span></span></div>
+      <div class="flex justify-between"><span class="text-slate-500">Multi-kills</span><span class="font-mono">2K ${p.multi.k2} · 3K ${p.multi.k3} · 4K ${p.multi.k4} · 5K ${p.multi.k5}</span></div>
+      <div class="flex justify-between"><span class="text-slate-500">Utility dmg</span><span class="font-mono">${p.utilityDamage}</span></div>
+    </div>`;
+
+  return `
+    <div class="grid grid-cols-1 sm:grid-cols-2 gap-4 p-3 bg-slate-950/40 rounded-lg">
+      <div class="space-y-1.5">
+        <div class="text-[10px] uppercase tracking-wide text-slate-500">Per-map form</div>
+        ${mapRows}
+      </div>
+      <div class="space-y-1.5">
+        <div class="text-[10px] uppercase tracking-wide text-slate-500">Top weapons</div>
+        ${wepRows}
+      </div>
+      <div class="sm:col-span-2 pt-1 border-t border-slate-800">${splits}</div>
+    </div>`;
+}
+
+// Side-by-side comparison of two aggregated players.
+function comparePanel(players) {
+  const a = players.find((p) => p.key === compareKeys[0]);
+  const b = players.find((p) => p.key === compareKeys[1]);
+  if (!a || !b) return "";
+  // metric: [label, valueFn, higherIsBetter, fmt]
+  const metrics = [
+    ["Rating", (p) => p.rating, true, (v) => v.toFixed(2)],
+    ["K/D", (p) => p.kd, true, (v) => v.toFixed(2)],
+    ["ADR", (p) => p.adr, true, (v) => v.toFixed(1)],
+    ["KAST", (p) => p.kast, true, (v) => v.toFixed(0) + "%"],
+    ["HS%", (p) => p.hsPct, true, (v) => v.toFixed(0) + "%"],
+    ["Opening +/-", (p) => p.openingKills - p.openingDeaths, true, (v) => (v > 0 ? "+" : "") + v],
+    ["Clutches", (p) => p.clutchesWon, true, (v) => String(v)],
+    ["Matches", (p) => p.matches, true, (v) => String(v)],
+  ];
+  const win = "text-emerald-400 font-bold";
+  const rows = metrics.map(([label, fn, hib, fmt]) => {
+    const va = fn(a), vb = fn(b);
+    const aWins = hib ? va > vb : va < vb, bWins = hib ? vb > va : vb < va;
+    return `
+      <div class="grid grid-cols-3 items-center text-xs py-1 border-t border-slate-800">
+        <span class="text-right font-mono ${aWins ? win : "text-slate-300"}">${fmt(va)}</span>
+        <span class="text-center text-[10px] uppercase tracking-wide text-slate-500">${esc(label)}</span>
+        <span class="text-left font-mono ${bWins ? win : "text-slate-300"}">${fmt(vb)}</span>
+      </div>`;
+  }).join("");
+  return `
+    <div class="bg-panel rounded-xl p-4 border border-accent/40 space-y-1">
+      <div class="grid grid-cols-3 items-center text-sm font-bold">
+        <span class="text-right truncate">${esc(a.nickname)}</span>
+        <span class="text-center text-[10px] uppercase tracking-widest text-accent">Head-to-head</span>
+        <span class="text-left truncate">${esc(b.nickname)}</span>
+      </div>
+      ${rows}
+      <div class="text-center pt-1">
+        <button data-action="clear-compare" class="text-[11px] text-slate-500 hover:text-red-400 transition">Clear comparison</button>
+      </div>
+    </div>`;
+}
+
+// Leaderboard table shared by both dashboard scopes. Rows expand to an insight
+// panel; the checkbox selects players for head-to-head comparison.
 function dashboardTable(players) {
   if (!players.length) {
     return `<p class="text-slate-500 text-sm">No CS match data yet. Play a map with its Match ID and your plugin's upload will appear here.</p>`;
   }
-  const body = players.map((p, idx) => `
-    <tr class="border-t border-slate-800">
-      <td class="py-1.5 pr-2 text-slate-500 text-center">${idx + 1}</td>
-      <td class="py-1.5 pr-2 font-medium">${esc(p.nickname)}</td>
+  const body = players.map((p, idx) => {
+    const open = expandedPlayer === p.key;
+    const checked = compareKeys.includes(p.key);
+    const row = `
+    <tr class="border-t border-slate-800 ${open ? "bg-slate-800/30" : ""}">
+      <td class="py-1.5 pr-1 text-center">
+        <button data-action="toggle-compare" data-key="${esc(p.key)}" title="Compare"
+          class="w-4 h-4 rounded border ${checked ? "bg-accent border-accent" : "border-slate-600 hover:border-slate-400"} text-ink text-[9px] leading-none">${checked ? "✓" : ""}</button>
+      </td>
+      <td class="py-1.5 pr-2 text-slate-500 text-center font-mono">${idx + 1}</td>
+      <td class="py-1.5 pr-2 font-medium">
+        <button data-action="toggle-player" data-key="${esc(p.key)}" class="hover:text-accent transition text-left">
+          ${open ? "▾" : "▸"} ${esc(p.nickname)}</button>
+      </td>
+      <td class="px-2 text-center font-mono">${ratingCell(p.rating)}</td>
       <td class="px-2 text-center font-mono">${p.matches}</td>
       <td class="px-2 text-center font-mono">${p.kills}</td>
       <td class="px-2 text-center font-mono">${p.deaths}</td>
@@ -1259,17 +1745,34 @@ function dashboardTable(players) {
       <td class="px-2 text-center font-mono">${p.hsPct.toFixed(0)}%</td>
       <td class="px-2 text-center font-mono">${p.kast.toFixed(0)}%</td>
       <td class="px-2 text-center font-mono">${p.mvps}</td>
-    </tr>`).join("");
-  // Hover tooltips explaining each column. `extra` adds left-alignment etc.
+    </tr>`;
+    const detail = open
+      ? `<tr><td colspan="13" class="px-2 pb-3">${playerInsightPanel(p)}</td></tr>`
+      : "";
+    return row + detail;
+  }).join("");
+  // Hover tooltips explaining each column. A styled popup appears below the
+  // header on hover (placed below so the table's overflow-x container doesn't
+  // clip it); the native `title` stays as an accessibility fallback. `extra`
+  // carries per-cell layout classes (padding / alignment).
   const th = (label, tip, extra = "px-2") =>
-    `<th class="${extra}"><span class="cursor-help border-b border-dotted border-slate-600" title="${esc(tip)}">${label}</span></th>`;
+    `<th class="${extra} relative">
+      <span class="group inline-flex items-center justify-center gap-0.5 cursor-help" title="${esc(tip)}">
+        <span class="border-b border-dotted border-slate-500">${label}</span>
+        <span class="pointer-events-none absolute top-full left-1/2 -translate-x-1/2 mt-1 z-30 hidden group-hover:block
+          w-44 normal-case tracking-normal text-left rounded-md bg-slate-950 border border-slate-700 px-2.5 py-1.5
+          text-[11px] leading-snug font-normal text-slate-200 shadow-xl whitespace-normal">${esc(tip)}</span>
+      </span>
+    </th>`;
   return `
     <div class="overflow-x-auto">
       <table class="w-full text-xs">
         <thead class="text-slate-500 uppercase tracking-wide text-[10px]">
           <tr>
+            <th class="py-1 pr-1"></th>
             <th class="py-1 pr-2">#</th>
-            ${th("Player", "In-game player nickname.", "py-1 pr-2 text-left")}
+            ${th("Player", "In-game player nickname. Click a row to expand per-map form, top weapons, opening duels, clutches and multi-kills.", "py-1 pr-2 text-left")}
+            ${th("RAT", "Rating — approximate HLTV Rating 2.0 from KAST, per-round kills/deaths/assists, impact and ADR. ~1.00 is average; 1.15+ is excellent.")}
             ${th("M", "Matches — number of maps with uploaded CS data counted for this player.")}
             ${th("K", "Kills — total enemy kills across all counted maps.")}
             ${th("D", "Deaths — total times this player died.")}
@@ -1287,32 +1790,42 @@ function dashboardTable(players) {
 }
 
 function renderDashboard() {
-  const scope = view.scope === "global" ? "global" : "championship";
-  const canChampionship = !!tournament;
+  const scope = urlScope;
+  // The per-championship view needs a championship id; offer that tab only when
+  // we have one (loaded from ?id=, present when arriving from a bracket).
+  const canChampionship = !!championshipId;
 
-  const tab = (key, label, enabled) => {
+  const tab = (key, label, enabled, href) => {
     const active = scope === key;
     if (!enabled) return "";
-    return `<button data-action="dashboard" data-scope="${key}"
-      class="px-3 py-1.5 rounded-lg text-sm font-semibold transition ${active ? "bg-accent text-ink" : "bg-slate-800 text-slate-300 hover:bg-slate-700"}">${esc(label)}</button>`;
+    const cls = `px-3 py-1.5 rounded-lg text-sm font-semibold transition ${active ? "bg-accent text-ink" : "bg-slate-800 text-slate-300 hover:bg-slate-700"}`;
+    return `<a href="${esc(href)}" class="${cls}">${esc(label)}</a>`;
   };
 
-  let table, subtitle;
+  // Build the per-match rows for the active scope, then aggregate by player.
+  let rows = [], subtitle;
   if (scope === "championship") {
     const uuids = new Set(allMapUuids(tournament));
-    const rows = [];
     for (const id of uuids) {
       const cs = csMatchCache[id];
-      if (cs && Array.isArray(cs.players)) rows.push(...cs.players.map(csPlayerRow));
+      // Inject the match's map onto each player so per-map form can aggregate.
+      if (cs && Array.isArray(cs.players)) rows.push(...cs.players.map((pl) => csPlayerRow({ ...pl, map: pl.map || cs.map })));
     }
-    table = dashboardTable(aggregatePlayers(rows));
     subtitle = `${esc(championshipName || "Championship")} · players across all maps with uploaded CS data`;
   } else {
-    const rows = (csGlobalStats || []).map(csPlayerRow);
-    table = dashboardTable(aggregatePlayers(rows));
+    rows = (csGlobalStats || []).map(csPlayerRow);
     subtitle = "Your all-time stats across every championship";
   }
+  const players = aggregatePlayers(rows);
 
+  // Keep compare selection valid against the players actually present.
+  compareKeys = compareKeys.filter((k) => players.some((p) => p.key === k));
+  const compare = compareKeys.length === 2 ? comparePanel(players) : "";
+  const hint = players.length
+    ? `<div class="text-[11px] text-slate-500">Click a player for per-map form, weapons &amp; clutch stats · tick two to compare.</div>`
+    : "";
+
+  let table = dashboardTable(players);
   if (dashboardLoading) {
     table = `<p class="text-slate-400 text-sm">Loading stats…</p>`;
   } else if (dashboardError) {
@@ -1325,19 +1838,23 @@ function renderDashboard() {
   }
 
   // Back target depends on where the user came from.
-  const back = tournament ? { action: "goto-bracket", label: "Bracket" } : { action: "goto-home", label: "Home" };
+  const back = championshipId
+    ? { href: urlBracket(championshipId), label: "Bracket" }
+    : { href: urlHome(), label: "Home" };
 
   shell(`
     <div class="max-w-4xl mx-auto space-y-4">
       <div class="flex items-center gap-2">
-        ${tab("championship", "This Championship", canChampionship)}
-        ${tab("global", "All-time (me)", true)}
+        ${tab("championship", "This Championship", canChampionship, urlDashboard("championship", championshipId))}
+        ${tab("global", "All-time (me)", true, urlDashboard("global"))}
       </div>
+      ${compare}
       <div class="bg-panel rounded-xl p-4 border border-slate-800 space-y-3">
         <div>
           <div class="text-sm font-bold">Player Dashboard</div>
           <div class="text-xs text-slate-500">${subtitle}</div>
         </div>
+        ${hint}
         ${table}
       </div>
     </div>`, { back });
@@ -1354,26 +1871,30 @@ async function onClick(e) {
 
   switch (action) {
     case "new":
-      view = { name: "name" };
+      pendingName = "";
+      pendingFormat = DEFAULT_FORMAT;
+      homeView = "name";
       return render();
 
-    case "name-submit": {
+    // Pick a format on the name screen, preserving the typed name across the
+    // re-render that highlights the selection.
+    case "set-format": {
       const input = document.querySelector("[data-name-input]");
-      const name = (input && input.value.trim()) || `Championship ${championships.length + 1}`;
-      view = { name: "select", pendingName: name };
+      if (input) pendingName = input.value;
+      if (FORMATS[el.dataset.format]) pendingFormat = el.dataset.format;
       return render();
     }
 
-    case "goto-home":
-      tournament = null;
-      championshipId = null;
-      championshipName = "";
-      await withLoading("Loading championships…", refreshChampionships);
-      view = { name: "home" };
+    case "name-submit": {
+      const input = document.querySelector("[data-name-input]");
+      pendingName = (input && input.value.trim()) || `Championship ${championships.length + 1}`;
+      homeView = "select";
       return render();
+    }
 
-    case "goto-bracket":
-      view = { name: "bracket" };
+    // In-page return to the home listing (create wizard cancel / back).
+    case "goto-home":
+      homeView = "home";
       return render();
 
     case "reset-map-order":
@@ -1391,7 +1912,7 @@ async function onClick(e) {
       return;
 
     case "new-crew":
-      view = { name: "new-crew" };
+      homeView = "new-crew";
       return render();
 
     case "crew-submit": {
@@ -1403,7 +1924,7 @@ async function onClick(e) {
         try { localStorage.setItem(ACTIVE_CREW_KEY, crew.id); } catch { /* ignore */ }
         await withLoading("Loading team…", async () => { await refreshCrews(); await refreshChampionships(); });
       } catch (e) { console.error("create team failed", e); }
-      view = { name: "home" };
+      homeView = "home";
       return render();
     }
 
@@ -1499,7 +2020,7 @@ async function onClick(e) {
       }
       // If the deleted team was open as a championship, drop back to home.
       tournament = null; championshipId = null; championshipName = "";
-      view = { name: "home" };
+      homeView = "home";
       return render();
     }
 
@@ -1533,35 +2054,23 @@ async function onClick(e) {
     case "select-team": {
       const crew = activeCrew();
       if (!crew || !user) return;   // can only create within a team
-      const state = generateTournament(el.dataset.team);
-      const name = (view.pendingName || "").trim() || `Championship ${championships.length + 1}`;
+      const state = generateTournament(el.dataset.team, pendingFormat);
+      const name = (pendingName || "").trim() || `Championship ${championships.length + 1}`;
       try {
         const rec = await withLoading("Creating championship…",
           () => createChampionship(name, state, crew.id, crew.memberUids, user.uid));
-        championshipId = rec.id;
-        championshipName = rec.name;
+        return go(urlBracket(rec.id));   // open the new championship's bracket page
       } catch (e) {
         console.error("create failed", e);
-        championshipId = null;
-        championshipName = name;
+        await alertDialog({ title: "Couldn't create championship", message: friendlyErr(e), danger: true });
+        homeView = "home";
+        return render();
       }
-      tournament = state;
-      view = { name: "bracket" };
-      return render();
     }
 
-    case "resume": {
-      try {
-        const rec = await withLoading("Loading championship…", () => loadChampionship(el.dataset.id));
-        if (!rec) { await refreshChampionships(); return render(); }
-        championshipId = rec.id;
-        championshipName = rec.name;
-        tournament = rec.state;
-        view = { name: "bracket" };
-        maybeGrantChampionReward();   // already-won championship → grant on open
-      } catch (e) { console.error("resume failed", e); }
-      return render();
-    }
+    case "resume":
+      // The bracket page loads the championship from its ?id= on arrival.
+      return go(urlBracket(el.dataset.id));
 
     case "delete": {
       const ok = await confirmDialog({
@@ -1580,48 +2089,19 @@ async function onClick(e) {
         }
         await refreshChampionships();
       });
-      view = { name: "home" };
+      homeView = "home";
       return render();
     }
 
     case "open-match":
-      view = { name: "match", matchId };
-      render();
-      prefetchCsForMatch(matchId);   // fill in any uploaded CS results, then re-render
-      return;
+      return go(urlMatch(championshipId, matchId));
 
     case "match-info":
-      view = { name: "match-info", matchId, mapIdx: parseInt(el.dataset.mapidx, 10) };
-      return render();
-
-    case "goto-match": {
-      const id = matchId || view.matchId;
-      view = { name: "match", matchId: id };
-      render();
-      prefetchCsForMatch(id);
-      return;
-    }
+      return go(urlMatchInfo(championshipId, matchId, parseInt(el.dataset.mapidx, 10)));
 
     case "dashboard": {
       const scope = el.dataset.scope === "global" ? "global" : "championship";
-      view = { name: "dashboard", scope };
-      dashboardError = null;
-      dashboardLoading = true;
-      render();
-      try {
-        if (scope === "championship" && tournament) {
-          Object.assign(csMatchCache, await getCsMatches(allMapUuids(tournament)));
-        } else if (scope === "global" && user) {
-          csGlobalStats = await getCsPlayerMatchesByUser(user.uid);
-        }
-      } catch (e) {
-        console.error("dashboard load failed", e);
-        dashboardError = (e && (e.code || e.message)) ? `${e.code || ""} ${e.message || ""}`.trim() : "Failed to load stats.";
-      } finally {
-        dashboardLoading = false;
-      }
-      if (view.name === "dashboard" && view.scope === scope) render();
-      return;
+      return go(urlDashboard(scope, scope === "championship" ? championshipId : null));
     }
 
     case "import-result": {
@@ -1654,7 +2134,8 @@ async function onClick(e) {
       return;
     }
 
-    case "copy-match-id": {
+    case "copy-match-id":
+    case "copy-uid": {
       const id = el.dataset.id;
       if (!id) return;
       const ok = await copyToClipboard(id);
@@ -1663,6 +2144,42 @@ async function onClick(e) {
       setTimeout(() => { el.textContent = original; }, 1200);
       return;
     }
+
+    case "save-nickname": {
+      const input = document.querySelector("[data-nick-input]");
+      const nick = (input && input.value.trim()) || "";
+      if (!nick) { flash(input); return; }
+      try {
+        await withLoading("Saving nickname…", () => saveProfile(user.uid, nick));
+        userNickname = nick;
+      } catch (e) {
+        console.error("save nickname failed", e);
+        await alertDialog({ title: "Couldn't save nickname", message: friendlyErr(e), danger: true });
+        return;
+      }
+      return render();   // clears the onboarding gate once a nickname is set
+    }
+
+    case "skip-onboarding":
+      onboardingDismissed = true;
+      return render();
+
+    // Dashboard: expand/collapse a player's insight panel.
+    case "toggle-player":
+      expandedPlayer = expandedPlayer === el.dataset.key ? null : el.dataset.key;
+      return render();
+
+    // Dashboard: select up to two players for head-to-head comparison.
+    case "toggle-compare": {
+      const key = el.dataset.key;
+      if (compareKeys.includes(key)) compareKeys = compareKeys.filter((k) => k !== key);
+      else compareKeys = [...compareKeys, key].slice(-2);   // keep the two most recent
+      return render();
+    }
+
+    case "clear-compare":
+      compareKeys = [];
+      return render();
 
     case "start-veto":
       return update((t) => {
@@ -1720,12 +2237,7 @@ async function onClick(e) {
       });
       if (!ok) return;
       try { if (championshipId) await deleteChampionship(championshipId); } catch (e2) { console.error(e2); }
-      tournament = null;
-      championshipId = null;
-      championshipName = "";
-      await refreshChampionships();
-      view = { name: "home" };
-      return render();
+      return go(urlHome());
     }
   }
 }
@@ -1752,6 +2264,7 @@ function friendlyErr(e) {
 // Enter-key submits the focused text input by triggering its paired button.
 const ENTER_SUBMITS = [
   { sel: "[data-name-input]", action: '[data-action="name-submit"]' },
+  { sel: "[data-nick-input]", action: '[data-action="save-nickname"]' },
   { sel: "[data-crew-input]", action: '[data-action="crew-submit"]' },
   { sel: "[data-invite-input]", action: '[data-action="invite-email"]' },
   { sel: "[data-team-name-input]", action: '[data-action="save-crew-name"]' },
@@ -1776,18 +2289,21 @@ async function main() {
   });
 
   // Gate the whole app on auth state. Fires immediately with the current user
-  // (or null) and again on every sign-in/sign-out.
+  // (or null) and again on every sign-in/sign-out. Each page rebuilds only the
+  // state it needs from the URL — there is no shared in-memory navigation.
   onAuth(async (u) => {
     user = u || null;
     if (!user) {
       crews = []; invites = []; championships = []; allChampionships = [];
       tournament = null; championshipId = null; championshipName = "";
+      userNickname = ""; profileLoaded = false; onboardingDismissed = false;
       return render();
     }
     try {
-      await withLoading("Loading your teams…", async () => {
+      await withLoading("Loading…", async () => {
+        await loadUserProfile();
         await refreshCrews();
-        await refreshChampionships();
+        await loadPageState();
       });
     } catch (err) {
       console.error("startup load failed:", err);
@@ -1795,9 +2311,84 @@ async function main() {
     // Owner: propagate membership to the active team's existing championships.
     const c = activeCrew();
     if (c && c.ownerUid === user.uid) syncCrewMembership(c.id).catch(() => {});
-    view = { name: "home" };
     render();
   });
+}
+
+// Load the signed-in user's profile (CS nickname). Best-effort: a read failure
+// (e.g. rules not deployed) leaves the nickname empty but doesn't block the app.
+async function loadUserProfile() {
+  try {
+    const prof = user ? await getProfile(user.uid) : null;
+    userNickname = (prof && prof.nickname) || "";
+  } catch (e) {
+    console.error("profile load failed", e);
+    userNickname = "";
+  } finally {
+    profileLoaded = true;
+  }
+}
+
+// Load the data this page needs, addressed by the URL query string.
+async function loadPageState() {
+  if (PAGE === "home") {
+    return refreshChampionships();
+  }
+  if (PAGE === "bracket" || PAGE === "match" || PAGE === "info") {
+    await loadChampionshipFromUrl();
+    // The match / match-info pages need the uploaded CS results for that series.
+    if ((PAGE === "match" || PAGE === "info") && tournament && urlMatchId) {
+      await loadCsForMatch(urlMatchId);
+    }
+    return;
+  }
+  if (PAGE === "dashboard") {
+    return loadDashboardState();
+  }
+}
+
+// Populate csMatchCache with the uploaded CS results for one match's maps.
+async function loadCsForMatch(matchId) {
+  const m = findMatch(tournament, matchId);
+  if (!m || !m.veto || !m.veto.complete) return;
+  const uuids = (m.veto.mapIds || []).filter(Boolean);
+  if (!uuids.length) return;
+  try { Object.assign(csMatchCache, await getCsMatches(uuids)); }
+  catch (e) { console.error("CS match load failed", e); }
+}
+
+// Load the championship named by ?id= into the active-tournament state.
+async function loadChampionshipFromUrl() {
+  const id = params.get("id");
+  if (!id) return;
+  try {
+    const rec = await loadChampionship(id);
+    if (!rec) return;
+    championshipId = rec.id;
+    championshipName = rec.name;
+    tournament = rec.state;
+    maybeGrantChampionReward();   // already-won championship → grant on open
+  } catch (e) { console.error("championship load failed", e); }
+}
+
+// Load the data behind the dashboard (per-championship CS matches, or the
+// signed-in user's all-time per-player records), surfacing read failures.
+async function loadDashboardState() {
+  dashboardError = null;
+  dashboardLoading = true;
+  try {
+    if (urlScope === "championship") {
+      await loadChampionshipFromUrl();
+      if (tournament) Object.assign(csMatchCache, await getCsMatches(allMapUuids(tournament)));
+    } else if (user) {
+      csGlobalStats = await getCsPlayerMatchesByUser(user.uid);
+    }
+  } catch (e) {
+    console.error("dashboard load failed", e);
+    dashboardError = (e && (e.code || e.message)) ? `${e.code || ""} ${e.message || ""}`.trim() : "Failed to load stats.";
+  } finally {
+    dashboardLoading = false;
+  }
 }
 
 main();

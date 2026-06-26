@@ -94,6 +94,14 @@ service cloud.firestore {
       allow delete: if signedIn() && myUid() in existing().memberUids;
     }
 
+    // ---- User profiles (CS nickname etc.) ----
+    // Any signed-in user may read profiles (nicknames are shown in rosters /
+    // dashboards); a user may only write their own (doc id == their uid).
+    match /profiles/{uid} {
+      allow read: if signedIn();
+      allow write: if signedIn() && uid == myUid();
+    }
+
     // ---- CS match data (written by the external CS2 extractor plugin) ----
     // Read-only from this app: the plugin uploads match + per-player stats keyed
     // by the per-map matchUuid we generate. Any signed-in user may read them so

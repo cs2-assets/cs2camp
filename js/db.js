@@ -177,6 +177,25 @@ export async function getCsPlayerMatchesByUser(uid) {
     .sort((a, b) => (toMillis(b.endedAtUtc) || 0) - (toMillis(a.endedAtUtc) || 0));
 }
 
+// ---- User profile (CS nickname) ------------------------------------------
+
+const PROFILE_COLLECTION = "profiles";
+
+// The signed-in user's profile doc ({ uid, nickname, updatedAt }), or null.
+export async function getProfile(uid) {
+  if (!uid) return null;
+  const snap = await getDoc(doc(db, PROFILE_COLLECTION, uid));
+  return snap.exists() ? snap.data() : null;
+}
+
+// Create/update the user's profile. Doc id is the uid (enforced by the rules).
+export async function saveProfile(uid, nickname) {
+  if (!uid) throw new Error("saveProfile: missing uid");
+  const record = { uid, nickname: (nickname || "").trim(), updatedAt: Date.now() };
+  await setDoc(doc(db, PROFILE_COLLECTION, uid), record, { merge: true });
+  return record;
+}
+
 // Firestore Timestamp | millis | Date -> millis (best-effort, 0 if unknown).
 function toMillis(v) {
   if (!v) return 0;
