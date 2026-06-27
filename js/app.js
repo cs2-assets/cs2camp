@@ -9,6 +9,8 @@ import {
   loadChampionship,
   deleteChampionship,
   getCsMatches,
+  getReadyCsMatches,
+  markCsMatchImported,
   getCsPlayerMatchesByUser,
   getProfile,
   saveProfile,
@@ -98,11 +100,16 @@ const urlDashboard = (scope, id) => `dashboard.html?scope=${scope}${id ? `&id=${
 // match screen or dashboard is opened; absence means "not fetched / not yet
 // uploaded by the plugin". Cleared when switching away from a championship.
 let csMatchCache = {};
+// CS results the plugin has flagged ready to import (status == "READY"). The
+// user picks the one matching the map they just played; importing flips it to
+// "IMPORTED" so it drops out of this list. Loaded on the match screen.
+let readyCsMatches = [];
 let csGlobalStats = null;   // cached per-player records for the global dashboard
 let dashboardLoading = false;
 let dashboardError = null;  // last dashboard fetch error message, or null
 let expandedPlayer = null;  // dashboard: player key whose insight panel is open
 let compareKeys = [];       // dashboard: up to 2 player keys selected to compare
+let dashboardMetric = "rating"; // dashboard: which metric the time-series chart plots
 
 const ACTIVE_CREW_KEY = "cs2.activeCrewId";
 function activeCrew() {
@@ -1174,6 +1181,52 @@ function matchIdLine(match, i) {
     </div>`;
 }
 
+// The picker of ready-to-import CS results, shown on the map currently awaiting
+// a score. The plugin no longer keys uploads to a pre-generated ID, so the user
+// matches the right upload to the map they just played. Each candidate previews
+// how it would be recorded (Team A : Team B from the user's perspective) plus
+// enough metadata to tell them apart; results whose map matches this one float
+// to the top and are flagged. Importing flips the doc's status to IMPORTED.
+function csCandidatesBox(match, i, mapName) {
+  if (!readyCsMatches.length) return "";
+  const a = match.teamA, b = match.teamB;
+  const sameMap = (cs) => cs.map && mapName && String(cs.map).toLowerCase() === String(mapName).toLowerCase();
+  const ordered = [...readyCsMatches].sort((x, y) => (sameMap(y) ? 1 : 0) - (sameMap(x) ? 1 : 0));
+
+  const rows = ordered.map((cs) => {
+    const mapped = mapCsScore(match, i, cs);
+    const me = csMe(cs);
+    const score = mapped
+      ? `${esc(a.tag)} <span class="font-mono font-bold">${mapped.scoreA}:${mapped.scoreB}</span> ${esc(b.tag)}`
+      : `<span class="font-mono font-bold">${csNum(cs.score?.ct)}:${csNum(cs.score?.t)}</span> <span class="text-slate-500">CT:T</span>`;
+    const meta = [
+      fmtCsDateShort(cs.endedAtUtc),
+      `${fmtDuration(cs.durationSeconds)} min`,
+      cs.serverHostname ? esc(cs.serverHostname) : "",
+      me ? `you ${csNum(me.kills)}-${csNum(me.deaths)}-${csNum(me.assists)}` : "",
+    ].filter(Boolean).join(" · ");
+    const match_ = sameMap(cs);
+    return `
+      <div class="flex items-center justify-between gap-2 rounded bg-slate-900/70 border ${match_ ? "border-accent/40" : "border-slate-800"} px-2.5 py-1.5">
+        <div class="min-w-0">
+          <div class="flex items-center gap-1.5 text-xs font-medium">
+            ${mapIconImg(cs.map || mapName, "h-4 w-4")}<span class="truncate">${esc(cs.map || "Unknown map")}</span>
+            ${match_ ? '<span class="text-[9px] uppercase tracking-wide text-accent shrink-0">matches map</span>' : ""}
+          </div>
+          <div class="text-[10px] text-slate-500">${score}${meta ? ` · ${meta}` : ""}</div>
+        </div>
+        <button data-action="import-result" data-match="${match.id}" data-mapidx="${i}" data-csid="${esc(cs.id)}"
+          class="px-3 py-1 rounded bg-accent text-ink font-bold text-[11px] shrink-0 hover:brightness-110 transition">Import</button>
+      </div>`;
+  }).join("");
+
+  return `
+    <div class="rounded-md bg-accent/5 border border-accent/30 px-3 py-2 space-y-1.5">
+      <div class="text-[11px] text-accent">📥 Import a CS result for this map — pick the upload that matches what you played:</div>
+      ${rows}
+    </div>`;
+}
+
 function mapsPanel(match) {
   if (!match.veto || !match.veto.complete) return "";
   const a = match.teamA, b = match.teamB;
@@ -1231,21 +1284,8 @@ function mapsPanel(match) {
             <button data-action="save-score" data-match="${match.id}" data-map="${esc(mapName)}"
               class="px-3 py-1 rounded bg-emerald-600 hover:bg-emerald-500 transition text-sm">Enter Score</button>
           </div>`;
-      let importBox = "";
-      if (hasCs) {
-        // Preview the score exactly as it will be recorded (Team A : Team B).
-        const cs = csMatchCache[uuid];
-        const mapped = mapCsScore(match, i, cs);
-        const preview = mapped
-          ? `${esc(a.tag)} <span class="font-mono font-bold">${mapped.scoreA}:${mapped.scoreB}</span> ${esc(b.tag)}`
-          : `<span class="font-mono font-bold">${Number(cs.score?.ct) || 0}:${Number(cs.score?.t) || 0}</span>`;
-        importBox = `
-          <div class="rounded-md bg-accent/10 border border-accent/40 px-3 py-2 flex items-center justify-between gap-2">
-            <span class="text-[11px] text-accent">📥 CS result uploaded — ${preview} on ${esc(cs.map || mapName)}</span>
-            <button data-action="import-result" data-match="${match.id}" data-mapidx="${i}"
-              class="px-3 py-1 rounded bg-accent text-ink font-bold text-xs shrink-0 hover:brightness-110 transition">Import result</button>
-          </div>`;
-      }
+      // Let the user pick which uploaded CS result corresponds to this map.
+      const importBox = csCandidatesBox(match, i, mapName);
       return `
         <div data-maprow class="rounded bg-slate-900/60 border border-yellow-500/40 px-3 py-2 space-y-2">
           <div class="flex items-center justify-between">
@@ -1868,7 +1908,7 @@ function comparePanel(players) {
 // panel; the checkbox selects players for head-to-head comparison.
 function dashboardTable(players, { potm = false } = {}) {
   if (!players.length) {
-    return `<p class="text-slate-500 text-sm">No CS match data yet. Play a map with its Match ID and your plugin's upload will appear here.</p>`;
+    return `<p class="text-slate-500 text-sm">No CS match data yet. Play a map, then import your plugin's upload from the match screen and it will appear here.</p>`;
   }
   const colspan = potm ? 14 : 13;
   const body = players.map((p, idx) => {
@@ -2037,31 +2077,120 @@ function normalizeGame(d) {
   };
 }
 
-// SVG line chart of rating across the player's games (oldest → newest), with a
-// 1.00 average reference line and a win/loss-colored dot per game.
-function playerTrendChart(games) {
-  if (games.length < 2) return "";
-  const W = 100, H = 36;
-  const ratings = games.map((g) => g.rating);
-  const maxR = Math.max(1.3, ...ratings), minR = Math.min(0.7, ...ratings);
-  const span = maxR - minR || 1;
-  const px = (i) => (i / (games.length - 1)) * W;
-  const py = (r) => H - ((r - minR) / span) * H;
-  const path = games.map((g, i) => `${px(i).toFixed(2)},${py(g.rating).toFixed(2)}`).join(" ");
-  const baseY = py(1).toFixed(2);
-  const dots = games.map((g, i) => {
-    const c = g.result === "W" ? "rgb(52 211 153)" : g.result === "L" ? "rgb(248 113 113)" : "rgb(148 163 184)";
-    return `<circle cx="${px(i).toFixed(2)}" cy="${py(g.rating).toFixed(2)}" r="0.9" fill="${c}" />`;
+// Metrics the time-series chart can plot. `get` reads one game's value (null =
+// not applicable, e.g. a tied game has no win-rate point); `ref` is an optional
+// dashed reference line; `rollingOnly` hides noisy per-game dots (win-rate is
+// only meaningful as a moving rate, not a 0/100 scatter).
+const TREND_METRICS = [
+  { key: "rating",  label: "Rating", ref: 1.0,  get: (g) => g.rating, fmt: (v) => v.toFixed(2) },
+  { key: "kd",      label: "K/D",    ref: 1.0,  get: (g) => g.kd,     fmt: (v) => v.toFixed(2) },
+  { key: "adr",     label: "ADR",    ref: null, get: (g) => g.adr,    fmt: (v) => v.toFixed(0) },
+  { key: "kast",    label: "KAST",   ref: null, get: (g) => g.kast,   fmt: (v) => v.toFixed(0) + "%" },
+  { key: "hs",      label: "HS%",    ref: null, get: (g) => g.hsPct,  fmt: (v) => v.toFixed(0) + "%" },
+  { key: "winrate", label: "Win%",   ref: 50,   rollingOnly: true,
+    get: (g) => (g.result === "W" ? 100 : g.result === "L" ? 0 : null), fmt: (v) => v.toFixed(0) + "%" },
+];
+
+function fmtDayShort(ms) {
+  try { return new Date(ms).toLocaleDateString(undefined, { month: "short", day: "numeric" }); } catch { return ""; }
+}
+
+// Time-series chart of one selectable metric across the player's games. The
+// x-axis is real time when dates are available (so quiet stretches show as
+// gaps), otherwise game order. Each game is a win/loss-colored dot and a
+// moving-average line draws the underlying trend. `metricKey` is the active tab.
+function performanceTrends(games, metricKey) {
+  if (games.length < 3) return "";
+
+  // Only offer a metric if enough games carry a usable value for it.
+  const decided = games.filter((g) => g.result === "W" || g.result === "L").length;
+  const avail = TREND_METRICS.filter((m) =>
+    m.key === "winrate"
+      ? decided >= 3
+      : games.filter((g) => { const v = m.get(g); return v != null && !isNaN(v) && v > 0; }).length >= 3
+  );
+  const metric = avail.find((m) => m.key === metricKey) || avail[0];
+  if (!metric) return "";
+
+  const pts = [];
+  games.forEach((g, i) => {
+    const v = metric.get(g);
+    if (v == null || isNaN(v)) return;
+    if (metric.key !== "winrate" && !(v > 0)) return;
+    pts.push({ i, date: g.date, v, result: g.result });
+  });
+  if (pts.length < 3) return "";
+
+  // Moving average over the most recent `win` points at each step.
+  const win = Math.min(7, Math.max(3, Math.round(pts.length / 5)));
+  const roll = pts.map((p, idx) => {
+    const seg = pts.slice(Math.max(0, idx - win + 1), idx + 1);
+    return seg.reduce((s, q) => s + q.v, 0) / seg.length;
+  });
+
+  // y domain from the data (plus the reference line), padded so points breathe.
+  const allV = pts.map((p) => p.v).concat(roll);
+  if (metric.ref != null) allV.push(metric.ref);
+  let lo = Math.min(...allV), hi = Math.max(...allV);
+  const pad = (hi - lo) * 0.12 || Math.abs(hi) * 0.1 || 1;
+  lo -= pad; hi += pad;
+  if (metric.key === "winrate" || metric.key === "kast" || metric.key === "hs") { lo = Math.max(0, lo); hi = Math.min(100, hi); }
+
+  // x in real time when most points are dated and the span is non-zero.
+  const dated = pts.filter((p) => p.date > 0);
+  const useTime = dated.length >= pts.length * 0.6 && dated.length >= 2 &&
+    (dated[dated.length - 1].date - dated[0].date) > 0;
+  const xv = (p) => (useTime ? p.date : p.i);
+  const xs = pts.map(xv);
+  const xmin = Math.min(...xs), xmax = Math.max(...xs);
+
+  const W = 480, H = 168, padL = 36, padR = 10, padT = 12, padB = 24;
+  const plotW = W - padL - padR, plotH = H - padT - padB;
+  const X = (p) => padL + ((xv(p) - xmin) / (xmax - xmin || 1)) * plotW;
+  const Y = (v) => padT + (1 - (v - lo) / (hi - lo || 1)) * plotH;
+
+  const grid = [hi, (hi + lo) / 2, lo].map((gv) => `
+    <line x1="${padL}" y1="${Y(gv).toFixed(1)}" x2="${W - padR}" y2="${Y(gv).toFixed(1)}" stroke="rgb(100 116 139 / 0.18)" stroke-width="0.5"/>
+    <text x="${padL - 4}" y="${(Y(gv) + 3).toFixed(1)}" text-anchor="end" font-size="9" fill="rgb(100 116 139)">${esc(metric.fmt(gv))}</text>`).join("");
+
+  const refLine = (metric.ref != null && metric.ref >= lo && metric.ref <= hi)
+    ? `<line x1="${padL}" y1="${Y(metric.ref).toFixed(1)}" x2="${W - padR}" y2="${Y(metric.ref).toFixed(1)}" stroke="rgb(148 163 184 / 0.6)" stroke-width="0.7" stroke-dasharray="3 3"/>`
+    : "";
+
+  const dots = metric.rollingOnly ? "" : pts.map((p) => {
+    const c = p.result === "W" ? "rgb(52 211 153)" : p.result === "L" ? "rgb(248 113 113)" : "rgb(148 163 184)";
+    return `<circle cx="${X(p).toFixed(1)}" cy="${Y(p.v).toFixed(1)}" r="1.7" fill="${c}" opacity="0.7"/>`;
   }).join("");
+
+  const rollPath = pts.map((p, idx) => `${X(p).toFixed(1)},${Y(roll[idx]).toFixed(1)}`).join(" ");
+  const line = `<polyline points="${rollPath}" fill="none" stroke="rgb(245 158 11)" stroke-width="2" stroke-linejoin="round" stroke-linecap="round"/>`;
+
+  const mid = pts[Math.floor((pts.length - 1) / 2)];
+  const xText = (p) => (useTime ? fmtDayShort(p.date) : `Game ${p.i + 1}`);
+  const xLabels = `
+    <text x="${X(pts[0]).toFixed(1)}" y="${H - 8}" text-anchor="start" font-size="9" fill="rgb(100 116 139)">${esc(xText(pts[0]))}</text>
+    <text x="${X(mid).toFixed(1)}" y="${H - 8}" text-anchor="middle" font-size="9" fill="rgb(100 116 139)">${esc(xText(mid))}</text>
+    <text x="${X(pts[pts.length - 1]).toFixed(1)}" y="${H - 8}" text-anchor="end" font-size="9" fill="rgb(100 116 139)">${esc(xText(pts[pts.length - 1]))}</text>`;
+
+  const tabs = avail.map((m) => {
+    const on = m.key === metric.key;
+    return `<button data-action="dash-metric" data-metric="${m.key}" class="px-2.5 py-1 rounded-md text-[11px] font-semibold transition ${on ? "bg-accent text-ink" : "bg-slate-800 text-slate-300 hover:bg-slate-700"}">${esc(m.label)}</button>`;
+  }).join("");
+
   return `
-    <div class="space-y-1">
-      <div class="text-[11px] text-slate-400">Rating over time
-        <span class="text-slate-600">(oldest → newest · dashed = 1.00 average · green win / red loss)</span></div>
-      <svg viewBox="0 0 ${W} ${H}" preserveAspectRatio="none" class="w-full h-28 rounded bg-slate-950/40">
-        <line x1="0" y1="${baseY}" x2="${W}" y2="${baseY}" stroke="rgb(100 116 139 / 0.5)" stroke-width="0.4" stroke-dasharray="1.5 1.5" />
-        <polyline points="${path}" fill="none" stroke="rgb(245 158 11)" stroke-width="1.1" vector-effect="non-scaling-stroke" stroke-linejoin="round" stroke-linecap="round" />
+    <div class="space-y-2">
+      <div class="flex items-center justify-between gap-2 flex-wrap">
+        <div class="text-[11px] uppercase tracking-wide text-slate-500">${esc(metric.label)} over time</div>
+        <div class="flex gap-1 flex-wrap">${tabs}</div>
+      </div>
+      <svg viewBox="0 0 ${W} ${H}" preserveAspectRatio="xMidYMid meet" class="w-full h-auto rounded bg-slate-950/40">
+        ${grid}
+        ${refLine}
+        ${line}
         ${dots}
+        ${xLabels}
       </svg>
+      <div class="text-[10px] text-slate-600">${win}-game moving average (amber)${metric.rollingOnly ? "" : " · green win / red loss · each dot is one map"}${metric.ref != null ? ` · dashed = ${esc(metric.fmt(metric.ref))}` : ""}</div>
     </div>`;
 }
 
@@ -2254,7 +2383,7 @@ function playerIntelligence(rawDocs, me) {
         ${stat("Avg rating", me ? me.rating.toFixed(2) : "—")}
         ${stat("Current streak", streakTxt, streakType === "W" ? "on a roll" : streakType === "L" ? "bounce back" : "")}
       </div>
-      ${playerTrendChart(games)}
+      ${performanceTrends(games, dashboardMetric)}
       <div class="grid grid-cols-1 lg:grid-cols-2 gap-4">
         <div class="space-y-2">
           <div class="text-[11px] uppercase tracking-wide text-slate-500">Insights</div>
@@ -2610,9 +2739,9 @@ async function onClick(e) {
     case "import-result": {
       const idx = parseInt(el.dataset.mapidx, 10);
       const m = findMatch(tournament, matchId);
-      const uuid = m && m.veto && m.veto.mapIds && m.veto.mapIds[idx];
-      const cs = uuid && csMatchCache[uuid];
-      if (!cs) { await alertDialog({ title: "No result", message: "No CS data is available for this map yet." }); return; }
+      // The user picked a specific ready-to-import candidate from the list.
+      const cs = readyCsMatches.find((c) => c.id === el.dataset.csid);
+      if (!cs) { await alertDialog({ title: "No result", message: "That CS result is no longer available — refresh and try again." }); return; }
       const mapped = mapCsScore(m, idx, cs);
       if (!mapped || mapped.scoreA === mapped.scoreB) {
         await alertDialog({ title: "Can't import", message: "The CS result couldn't be mapped to a clear winner. Enter the score manually." });
@@ -2630,9 +2759,18 @@ async function onClick(e) {
             mm.veto.sides[idx] = { sideA, sideB: sideA === "CT" ? "T" : "CT" };
           }
         }
+        // Bind this map to the chosen upload so the Details view can find it.
+        if (mm.veto && Array.isArray(mm.veto.mapIds) && cs.matchUuid) mm.veto.mapIds[idx] = cs.matchUuid;
         const done = recordMap(mm, mm.veto.picked[idx], mapped.scoreA, mapped.scoreB);
         if (done) { advanceWinner(t, mm); resolveAiMatches(t); }
       }, "Importing match result…");
+      // Flip the source doc to IMPORTED so it stops showing as a candidate, and
+      // keep the local caches in sync (drop from candidates, add for Details).
+      if (cs.matchUuid) csMatchCache[cs.matchUuid] = cs;
+      readyCsMatches = readyCsMatches.filter((c) => c.id !== cs.id);
+      render();   // reflect the dropped candidate on any remaining next-map row
+      try { await markCsMatchImported(cs.id); }
+      catch (e) { console.error("mark CS imported failed", e); }
       maybeGrantChampionReward();
       return;
     }
@@ -2682,6 +2820,11 @@ async function onClick(e) {
 
     case "clear-compare":
       compareKeys = [];
+      return render();
+
+    // Dashboard: switch which metric the time-series chart plots.
+    case "dash-metric":
+      dashboardMetric = el.dataset.metric || "rating";
       return render();
 
     case "start-veto":
@@ -2864,10 +3007,16 @@ async function loadPageState() {
 async function loadCsForMatch(matchId) {
   const m = findMatch(tournament, matchId);
   if (!m || !m.veto || !m.veto.complete) return;
+  // Candidates the user can still import (uploaded by the plugin, status READY).
+  try { readyCsMatches = await getReadyCsMatches(); }
+  catch (e) { console.error("ready CS matches load failed", e); }
+  // Plus the CS results already imported onto this series' maps, so the Details
+  // view can render them. mapIds hold the imported results' matchUuids.
   const uuids = (m.veto.mapIds || []).filter(Boolean);
-  if (!uuids.length) return;
-  try { Object.assign(csMatchCache, await getCsMatches(uuids)); }
-  catch (e) { console.error("CS match load failed", e); }
+  if (uuids.length) {
+    try { Object.assign(csMatchCache, await getCsMatches(uuids)); }
+    catch (e) { console.error("CS match load failed", e); }
+  }
 }
 
 // Load the championship named by ?id= into the active-tournament state.

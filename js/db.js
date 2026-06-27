@@ -19,6 +19,7 @@ import {
   getDoc,
   getDocs,
   setDoc,
+  updateDoc,
   deleteDoc,
   query,
   where,
@@ -163,6 +164,24 @@ export async function getCsMatches(matchUuids) {
     });
   }
   return out;
+}
+
+// Fetch every CS match the plugin has flagged as ready to import
+// (status == "READY"), newest-first. Each entry carries its Firestore doc id
+// (`id`) alongside the match data so it can be marked imported afterwards.
+export async function getReadyCsMatches() {
+  const snap = await getDocs(
+    query(collection(db, CS_MATCH_COLLECTION), where("status", "==", "READY"))
+  );
+  return snap.docs
+    .map((d) => ({ id: d.id, ...d.data() }))
+    .sort((a, b) => (toMillis(b.endedAtUtc) || 0) - (toMillis(a.endedAtUtc) || 0));
+}
+
+// Flag a CS match document as imported so it no longer shows up as a candidate.
+export async function markCsMatchImported(docId) {
+  if (!docId) return;
+  await updateDoc(doc(db, CS_MATCH_COLLECTION, docId), { status: "IMPORTED" });
 }
 
 // Every per-player match record for a single user across all championships.

@@ -103,13 +103,17 @@ service cloud.firestore {
     }
 
     // ---- CS match data (written by the external CS2 extractor plugin) ----
-    // Read-only from this app: the plugin uploads match + per-player stats keyed
-    // by the per-map matchUuid we generate. Any signed-in user may read them so
-    // the organizer can import scores and render dashboards. Writes are reserved
-    // for the plugin (service account / admin), never the web client.
+    // The plugin uploads match + per-player stats and flags importable maps with
+    // status == "READY". Any signed-in user may read them so the organizer can
+    // import scores and render dashboards. The only write the web client may make
+    // is flipping a single doc's status to "IMPORTED" once it's been imported;
+    // all other fields, creates and deletes remain reserved for the plugin.
     match /cs_extractor_match/{matchId} {
       allow read: if signedIn();
-      allow write: if false;
+      allow update: if signedIn()
+        && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['status'])
+        && request.resource.data.status == 'IMPORTED';
+      allow create, delete: if false;
     }
     match /cs_extractor_player_match/{docId} {
       allow read: if signedIn();
