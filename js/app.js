@@ -1167,20 +1167,6 @@ function vetoPanel(match) {
     </div>`;
 }
 
-// A copyable line showing the unique UUID for a single map match.
-function matchIdLine(match, i) {
-  const id = match.veto.mapIds && match.veto.mapIds[i];
-  if (!id) return "";
-  return `
-    <div class="flex items-center gap-2 text-[10px] text-slate-500 font-mono">
-      <span class="uppercase tracking-wide not-italic text-slate-600">Match ID</span>
-      <span class="truncate" title="${esc(id)}">${esc(id)}</span>
-      <button data-action="copy-match-id" data-id="${esc(id)}"
-        class="px-1.5 py-0.5 rounded bg-slate-800 hover:bg-slate-700 text-slate-300 transition shrink-0"
-        title="Copy match ID">Copy</button>
-    </div>`;
-}
-
 // The picker of ready-to-import CS results, shown on the map currently awaiting
 // a score. The plugin no longer keys uploads to a pre-generated ID, so the user
 // matches the right upload to the map they just played. Each candidate previews
@@ -1256,10 +1242,7 @@ function mapsPanel(match) {
               ${sideBadge(played.sideB)}
             </span>
           </div>
-          <div class="flex items-center justify-between gap-2">
-            ${matchIdLine(match, i)}
-            ${details}
-          </div>
+          ${details ? `<div class="flex items-center justify-end">${details}</div>` : ""}
         </div>`;
     }
     if (isNext) {
@@ -1295,18 +1278,16 @@ function mapsPanel(match) {
           </div>
           ${importBox}
           ${body}
-          ${matchIdLine(match, i)}
         </div>`;
     }
     return `
-      <div class="rounded bg-slate-900/30 border border-slate-800/60 px-3 py-2 space-y-1 opacity-50">
+      <div class="rounded bg-slate-900/30 border border-slate-800/60 px-3 py-2 opacity-50">
         <div class="flex items-center justify-between">
           <span class="flex items-center gap-2 text-sm">${mapIconImg(mapName, "h-6 w-6")}${esc(mapName)}</span>
           ${sides
             ? `<span class="flex items-center gap-1 text-[10px]">${esc(a.tag)} ${sideBadge(sides.sideA)} · ${sideBadge(sides.sideB)} ${esc(b.tag)}</span>`
             : '<span class="text-xs text-slate-600">locked</span>'}
         </div>
-        ${matchIdLine(match, i)}
       </div>`;
   }).join("");
 
@@ -2775,7 +2756,6 @@ async function onClick(e) {
       return;
     }
 
-    case "copy-match-id":
     case "copy-uid": {
       const id = el.dataset.id;
       if (!id) return;
