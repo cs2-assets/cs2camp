@@ -11,6 +11,7 @@ import {
   getCsMatches,
   getReadyCsMatches,
   markCsMatchImported,
+  markCsMatchIgnored,
   getCsPlayerMatchesByUser,
   getProfile,
   saveProfile,
@@ -1201,8 +1202,12 @@ function csCandidatesBox(match, i, mapName) {
           </div>
           <div class="text-[10px] text-slate-500">${score}${meta ? ` · ${meta}` : ""}</div>
         </div>
-        <button data-action="import-result" data-match="${match.id}" data-mapidx="${i}" data-csid="${esc(cs.id)}"
-          class="px-3 py-1 rounded bg-accent text-ink font-bold text-[11px] shrink-0 hover:brightness-110 transition">Import</button>
+        <div class="flex items-center gap-1.5 shrink-0">
+          <button data-action="import-result" data-match="${match.id}" data-mapidx="${i}" data-csid="${esc(cs.id)}"
+            class="px-3 py-1 rounded bg-accent text-ink font-bold text-[11px] hover:brightness-110 transition">Import</button>
+          <button data-action="delete-candidate" data-csid="${esc(cs.id)}" title="Delete this upload"
+            class="px-2 py-1 rounded text-[11px] text-slate-500 hover:text-red-400 hover:bg-red-500/10 transition">Delete</button>
+        </div>
       </div>`;
   }).join("");
 
@@ -2753,6 +2758,31 @@ async function onClick(e) {
       try { await markCsMatchImported(cs.id); }
       catch (e) { console.error("mark CS imported failed", e); }
       maybeGrantChampionReward();
+      return;
+    }
+
+    // Dismiss a ready-to-import candidate the user doesn't want. Non-destructive:
+    // the upload is flipped to IGNORED so it stops showing as a candidate.
+    case "delete-candidate": {
+      const cs = readyCsMatches.find((c) => c.id === el.dataset.csid);
+      if (!cs) { render(); return; }
+      const ok = await confirmDialog({
+        title: "Delete this result?",
+        message: "This removes the upload from the import list. You won't be able to import it for any map.",
+        confirmLabel: "Delete",
+        danger: true,
+      });
+      if (!ok) return;
+      // Drop it locally first so the list updates immediately, then persist.
+      readyCsMatches = readyCsMatches.filter((c) => c.id !== cs.id);
+      render();
+      try { await markCsMatchIgnored(cs.id); }
+      catch (e) {
+        console.error("mark CS ignored failed", e);
+        readyCsMatches = [cs, ...readyCsMatches];   // restore on failure
+        render();
+        await alertDialog({ title: "Couldn't delete", message: friendlyErr(e), danger: true });
+      }
       return;
     }
 

@@ -106,13 +106,15 @@ service cloud.firestore {
     // The plugin uploads match + per-player stats and flags importable maps with
     // status == "READY". Any signed-in user may read them so the organizer can
     // import scores and render dashboards. The only write the web client may make
-    // is flipping a single doc's status to "IMPORTED" once it's been imported;
-    // all other fields, creates and deletes remain reserved for the plugin.
+    // is flipping a single doc's status to "IMPORTED" once it's been imported, or
+    // to "IGNORED" to dismiss an unwanted candidate (the IGNORED status is consumed
+    // elsewhere); all other fields, creates and deletes remain reserved for the
+    // plugin.
     match /cs_extractor_match/{matchId} {
       allow read: if signedIn();
       allow update: if signedIn()
         && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['status'])
-        && request.resource.data.status == 'IMPORTED';
+        && request.resource.data.status in ['IMPORTED', 'IGNORED'];
       allow create, delete: if false;
     }
     match /cs_extractor_player_match/{docId} {

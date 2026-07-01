@@ -184,6 +184,15 @@ export async function markCsMatchImported(docId) {
   await updateDoc(doc(db, CS_MATCH_COLLECTION, docId), { status: "IMPORTED" });
 }
 
+// Flag a CS match candidate as ignored so it stops showing up in the import
+// list without deleting it. Non-destructive: the raw upload is kept in Firestore
+// (its IGNORED status is consumed elsewhere), it just no longer matches the
+// READY candidate query.
+export async function markCsMatchIgnored(docId) {
+  if (!docId) return;
+  await updateDoc(doc(db, CS_MATCH_COLLECTION, docId), { status: "IGNORED" });
+}
+
 // Every per-player match record for a single user across all championships.
 // Used by the global all-time dashboard. Sorted newest-first client-side.
 export async function getCsPlayerMatchesByUser(uid) {
